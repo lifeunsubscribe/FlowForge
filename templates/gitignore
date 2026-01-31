@@ -1,0 +1,10 @@
+# Forge - Per-developer files (do not commit)
+scratch.md
+session-state/
+*.log
+.resume/
+
+# Committed files (team shares these):
+# config
+# blockers.conf
+# assessment-prompt.md

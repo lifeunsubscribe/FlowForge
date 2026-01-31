@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+# forge - FlowForge CLI for automated GitHub workflows
+# Smart dispatcher that routes to appropriate workflow
+#
+# Usage:
+#   forge <issue>              Process single issue (full lifecycle)
+#   forge <issue1> <issue2>    Process multiple issues (batch)
+#   forge <issue> --quick      Work + PR only, skip review/merge
+#   forge --followup           Auto-discover follow-up pairs
+#   forge --init               Initialize .forge/ in current project
+#   forge --dry-run <...>      Print execution plan without running
+
+set -euo pipefail
+
+VERSION="2.0.0"
+
+# Resolve symlink chain to get actual install location
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [ -L "$SCRIPT_PATH" ]; do
+  SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+  SCRIPT_PATH="$(readlink "$SCRIPT_PATH")"
+  [[ $SCRIPT_PATH != /* ]] && SCRIPT_PATH="$SCRIPT_DIR/$SCRIPT_PATH"
+done
+FORGE_INSTALL_DIR="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
+FORGE_LIB_DIR="$FORGE_INSTALL_DIR/lib"
+export FORGE_INSTALL_DIR FORGE_LIB_DIR
+
+# Parse --dry-run early (before config, so config respects it)
+for arg in "$@"; do
+  if [ "$arg" = "--dry-run" ]; then
+    export FORGE_DRY_RUN=true
+  fi
+done
+
+# Source configuration (detects project, loads configs)
+source "$FORGE_LIB_DIR/utils/config.sh"
+source "$FORGE_LIB_DIR/utils/colors.sh"
+
+# Default mode: full lifecycle (workflow-runner)
+MODE="full"
+
+# Parse args and detect intent
+ARGS=()
+FILTER=""
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --quick)
+      MODE="quick"
+      shift
+      ;;
+    --followup)
+      MODE="batch"
+      FILTER="--followup"
+      shift
+      ;;
+    --dry-run)
+      # Already parsed above
+      shift
+      ;;
+    --init)
+      MODE="init"
+      shift
+      ;;
+    --version|-v)
+      echo "forge version $VERSION"
+      exit 0
+      ;;
+    --help|-h)
+      echo "forge - FlowForge CLI v${VERSION}"
+      echo "Automate GitHub issues with Claude Code"
+      echo ""
+      echo "Usage:"
+      echo "  forge <issue>              Process single issue (full lifecycle)"
+      echo "  forge <issue1> <issue2>    Process multiple issues (batch)"
+      echo "  forge <issue> --quick      Work + PR only, skip review/merge"
+      echo "  forge --followup           Security debt report + batch process"
+      echo "  forge --init               Initialize .forge/ in current project"
+      echo "  forge --dry-run <...>      Print execution plan without running"
+      echo ""
+      echo "Project: $FORGE_PROJECT_NAME"
+      echo "Root:    $FORGE_PROJECT_ROOT"
+      echo "Config:  $FORGE_PROJECT_ROOT/$FORGE_DATA_DIR/config"
+      echo ""
+      echo "Examples:"
+      echo "  forge 21                   # Full lifecycle"
+      echo "  forge 21 45                # Batch process issues"
+      echo "  forge 21 --quick           # Quick mode: work + PR only"
+      echo "  forge --followup           # Process security-debt issues"
+      echo "  forge 21 --dry-run         # See what would happen"
+      echo ""
+      echo "FlowForge - Forge better workflows, faster."
+      exit 0
+      ;;
+    -*)
+      print_error "Unknown flag: $1"
+      exit 1
+      ;;
+    *)
+      ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+# Handle init mode
+if [ "$MODE" = "init" ]; then
+  print_header "Initializing Forge for $FORGE_PROJECT_NAME"
+
+  # Create .forge/ directory structure
+  mkdir -p "$FORGE_PROJECT_ROOT/$FORGE_DATA_DIR"
+
+  # Copy templates
+  if [ ! -f "$FORGE_PROJECT_ROOT/$FORGE_DATA_DIR/config" ]; then
+    cp "$FORGE_INSTALL_DIR/config/project.conf.example" "$FORGE_PROJECT_ROOT/$FORGE_DATA_DIR/config"
+    print_success "Created .forge/config"
+  else
+    print_info ".forge/config already exists, skipping"
+  fi
+
+  if [ ! -f "$FORGE_PROJECT_ROOT/$FORGE_DATA_DIR/blockers.conf" ]; then
+    cp "$FORGE_INSTALL_DIR/config/blockers.conf.example" "$FORGE_PROJECT_ROOT/$FORGE_DATA_DIR/blockers.conf"
+    print_success "Created .forge/blockers.conf"
+  else
+    print_info ".forge/blockers.conf already exists, skipping"
+  fi
+
+  if [ ! -f "$FORGE_PROJECT_ROOT/$FORGE_DATA_DIR/scratch.md" ]; then
+    cp "$FORGE_INSTALL_DIR/templates/scratchpad.md" "$FORGE_PROJECT_ROOT/$FORGE_DATA_DIR/scratch.md"
+    print_success "Created .forge/scratch.md"
+  else
+    print_info ".forge/scratch.md already exists, skipping"
+  fi
+
+  if [ ! -f "$FORGE_PROJECT_ROOT/$FORGE_DATA_DIR/.gitignore" ]; then
+    cp "$FORGE_INSTALL_DIR/templates/gitignore" "$FORGE_PROJECT_ROOT/$FORGE_DATA_DIR/.gitignore"
+    print_success "Created .forge/.gitignore"
+  else
+    print_info ".forge/.gitignore already exists, skipping"
+  fi
+
+  # Create backward-compat symlink if .claude/ exists
+  if [ -d "$FORGE_PROJECT_ROOT/.claude" ] && [ ! -e "$FORGE_PROJECT_ROOT/.claude/scratch.md" ]; then
+    ln -sf "../$FORGE_DATA_DIR/scratch.md" "$FORGE_PROJECT_ROOT/.claude/scratch.md"
+    print_success "Created .claude/scratch.md symlink for backward compatibility"
+  fi
+
+  print_success "Forge initialized for $FORGE_PROJECT_NAME"
+  echo ""
+  print_info "Next steps:"
+  echo "  1. Edit .forge/config with project-specific settings"
+  echo "  2. Edit .forge/blockers.conf to customize blocker path patterns"
+  echo "  3. Run 'forge 21' to process your first issue"
+  echo ""
+  exit 0
+fi
+
+# Smart routing
+if [ ${#ARGS[@]} -eq 0 ] && [ -z "$FILTER" ]; then
+  print_error "No issues specified"
+  echo "Run 'forge --help' for usage"
+  exit 1
+elif [ ${#ARGS[@]} -eq 1 ] && [ "$MODE" = "full" ]; then
+  # Full lifecycle: work -> PR -> review -> fixes -> merge
+  exec "$FORGE_LIB_DIR/core/workflow-runner.sh" "${ARGS[0]}" --auto
+elif [ ${#ARGS[@]} -eq 1 ] && [ "$MODE" = "quick" ]; then
+  # Quick mode: work -> PR only (skip review wait and merge)
+  print_info "Quick mode: issue #${ARGS[0]} (work + PR, skip review/merge)"
+  "$FORGE_LIB_DIR/core/claude-workflow.sh" "${ARGS[0]}" --auto
+  "$FORGE_LIB_DIR/core/create-pr.sh" --auto
+  print_success "Quick mode complete — PR created, skipping review/merge"
+  exit 0
+elif [ ${#ARGS[@]} -gt 1 ] || [ -n "$FILTER" ]; then
+  # Batch mode
+  print_info "Batch processing ${#ARGS[@]} issues"
+  exec "$FORGE_LIB_DIR/core/batch-process-issues.sh" "${ARGS[@]}" ${FILTER} --auto
+fi

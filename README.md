@@ -1,0 +1,340 @@
+# Forge
+
+**AI-powered GitHub workflow automation CLI — process issues end-to-end with Claude Code**
+
+Forge automates the full lifecycle of GitHub issue development: branch creation, Claude Code development, PR creation, review assessment, fix loops, and merge — with intelligent blocker detection and security feedback loops.
+
+---
+
+## Quick Start
+
+### Install
+
+```bash
+git clone <repo-url> /tmp/forge-install
+cd /tmp/forge-install
+./install.sh
+```
+
+This installs to `~/.forge/` and symlinks `forge` into `~/.local/bin/`.
+
+### Prerequisites
+
+- **git** — version control
+- **gh** — GitHub CLI (`brew install gh`)
+- **jq** — JSON parsing (`brew install jq`)
+- **claude** — Claude Code CLI (`npm install -g @anthropic-ai/claude-code`)
+
+### Initialize a Project
+
+```bash
+cd your-repo
+forge --init
+```
+
+Creates `.forge/` directory with default config and scratchpad.
+
+### Usage
+
+```bash
+# Process single issue (full lifecycle: work → PR → review → fixes → merge)
+forge 21
+
+# Quick mode (work → PR only, skip review/merge)
+forge 21 --quick
+
+# Process multiple issues in batch
+forge 21 45 31
+
+# Auto-discover and process follow-up pairs
+forge --followup
+
+# Dry run (show what would happen without executing)
+forge 21 --dry-run
+
+# Help
+forge --help
+```
+
+**Smart routing:**
+- `forge 21` → Full lifecycle (workflow-runner.sh)
+- `forge 21 --quick` → Work + PR only (claude-workflow.sh + create-pr.sh)
+- `forge 21 45` → Batch mode (batch-process-issues.sh)
+- `forge --followup` → Batch mode with follow-up filter
+
+---
+
+## How It Works
+
+```
+Issue #21 → workflow-runner.sh
+              ↓
+         Phase 1: claude-workflow.sh (development with Claude Code)
+              ↓
+         Phase 2: create-pr.sh (creates PR, waits for review)
+              ↓
+         Phase 3: assess-and-resolve.sh (assesses review)
+              ↓
+         CRITICAL found? → claude-workflow.sh --fix-review
+              ↓                    ↓
+         Loop up to 3x     Push fixes, wait for new review
+              ↓
+         Clean? → merge-pr.sh
+              ↓
+         Done. Security findings saved to scratchpad.
+```
+
+### Phases
+
+1. **Pre-Start Checks** — Validate credentials, check session limits
+2. **Claude Workflow** — Development with Claude Code in isolated worktree
+3. **Create PR** — Create PR, wait for automated review with dynamic wait times
+4. **Assess & Resolve** — Categorize review issues using Claude CLI (ACTIONABLE_NOW / ACTIONABLE_LATER / DISMISSED)
+5. **Merge PR** — Merge if safe, update documentation, save security findings
+6. **Completion** — Notifications, cleanup
+
+---
+
+## Configuration
+
+Forge uses a layered config system:
+
+```
+Defaults → ~/.config/forge/config (global) → .forge/config (project) → Environment variables
+```
+
+### Project Config (`.forge/config`)
+
+Created by `forge --init`. Key settings:
+
+```bash
+# Worktree base directory
+FORGE_WORKTREE_DIR="$HOME/Dev/worktrees/myproject"
+
+# Session limits
+FORGE_MAX_ISSUES_PER_SESSION=8
+FORGE_MAX_SESSION_HOURS=4
+
+# Claude assessment timeout (seconds)
+FORGE_ASSESSMENT_TIMEOUT=120
+```
+
+See [config/project.conf.example](config/project.conf.example) for all options.
+
+### Global Config (`~/.config/forge/config`)
+
+Settings that apply across all projects:
+
+```bash
+# Notifications
+SLACK_WEBHOOK_URL="https://hooks.slack.com/..."
+FORGE_EMAIL_FROM="forge@example.com"
+
+# AWS profile for notifications
+FORGE_AWS_PROFILE="default"
+```
+
+See [config/forge.conf.example](config/forge.conf.example) for all options.
+
+### Blocker Rules (`.forge/blockers.conf`)
+
+Customize which file patterns trigger blocker detection:
+
+```bash
+BLOCKER_INFRASTRUCTURE_PATHS="(cdk|cloudformation|terraform|pulumi)"
+BLOCKER_MIGRATION_PATHS="(prisma/migrations|migrations/|alembic/)"
+BLOCKER_AUTH_PATHS="(auth|cognito|jwt|oauth|session)"
+```
+
+See [config/blockers.conf.example](config/blockers.conf.example) for all patterns.
+
+### Assessment Customization
+
+Control how Claude assesses PR review issues:
+
+1. **`.forge/assessment-prompt.md`** — Full custom assessment prompt (highest priority)
+2. **`CLAUDE.md`** — Forge extracts security/conventions sections automatically
+3. **Generic fallback** — Built-in assessment criteria from `templates/assessment-prompt.md`
+
+---
+
+## Project Structure
+
+```
+forge/
+├── bin/forge                        # CLI entry point
+├── lib/
+│   ├── core/                        # Core workflow scripts
+│   │   ├── workflow-runner.sh       # Central orchestrator (5 phases)
+│   │   ├── claude-workflow.sh       # Claude Code development + worktree management
+│   │   ├── create-pr.sh            # PR creation + review waiting
+│   │   ├── assess-and-resolve.sh   # Review assessment + fix loop
+│   │   ├── assess-review-issues.sh # Claude CLI issue categorization
+│   │   ├── assess-documentation.sh # Pre-merge doc completeness check
+│   │   ├── merge-pr.sh             # PR merge + scratchpad update
+│   │   └── batch-process-issues.sh # Multi-issue batch processing
+│   └── utils/                       # Shared libraries
+│       ├── config.sh               # Layered configuration loader
+│       ├── colors.sh               # Terminal colors and print helpers
+│       ├── blocker-rules.sh        # 10 configurable blocker rules
+│       ├── scratchpad-manager.sh   # Security feedback loop
+│       ├── session-tracker.sh      # Session state and limits
+│       ├── notifications.sh        # Slack/Email/SMS notifications
+│       ├── format-review.sh        # Review content formatting
+│       ├── create-followup-issues.sh # GitHub issue creation
+│       ├── review-assessment.sh    # Assessment display helpers
+│       ├── cleanup-worktrees.sh    # Worktree cleanup utility
+│       └── validate-setup.sh       # Prerequisites validator
+├── config/                          # Example configurations
+│   ├── forge.conf.example          # Global config template
+│   ├── project.conf.example        # Per-project config template
+│   └── blockers.conf.example       # Blocker patterns template
+├── templates/                       # Templates for forge --init
+│   ├── scratchpad.md               # Scratchpad structure
+│   ├── assessment-prompt.md        # Generic assessment criteria
+│   └── gitignore                   # .forge/.gitignore template
+├── install.sh                       # Installer (idempotent)
+├── uninstall.sh                     # Uninstaller
+└── README.md                        # This file
+```
+
+---
+
+## Features
+
+### 10 Blocker Rules
+
+Prevents accidental bad merges. Each rule is configurable via `.forge/blockers.conf`:
+
+1. **Infrastructure Changes** — CDK, IAM, CloudFormation, Terraform
+2. **Database Migrations** — Prisma, Alembic, raw SQL migrations
+3. **Authentication/Authorization** — Cognito, JWT, OAuth, session logic
+4. **Architectural Documentation** — CLAUDE.md, architecture docs
+5. **CRITICAL Issues in Review** — Security risks, data integrity
+6. **Test/Build Failures** — Failed CI checks
+7. **Expensive AWS Services** — RDS, Aurora, NAT Gateway, EC2
+8. **Session Limits** — Configurable issue count and time limits
+9. **AWS Credentials Expired** — SSO session timeout
+10. **Protected Scripts Changed** — Workflow scripts modified
+
+### Smart Worktree Management
+
+- **Auto-detect**: Finds existing worktree for issue
+- **Auto-navigate**: Switches to correct worktree
+- **Auto-stash**: Stashes changes before navigation, pops when returning
+- **Auto-cleanup**: Removes merged branches at limit
+
+### Security Feedback Loop
+
+Scratchpad tracks security findings across PRs:
+
+1. PR review finds security issues
+2. `merge-pr.sh` extracts findings to scratchpad
+3. Next issue loads scratchpad into Claude Code context
+4. Claude Code avoids repeating same patterns
+5. Last 5 PRs in "Recent", last 20 in archive
+
+### Smart Review Assessment
+
+Uses Claude CLI for intelligent PR review filtering:
+
+- **ACTIONABLE_NOW** — Fix in this PR cycle (security, bugs, quick wins)
+- **ACTIONABLE_LATER** — Valid but defer to follow-up issue
+- **DISMISSED** — Not worth tracking (style preferences, theoretical edge cases)
+
+Each item shows severity, category, and reasoning for the decision.
+
+### Auto-Fix Loop
+
+When CRITICAL issues are found:
+1. Saves filtered review → calls `claude-workflow.sh --fix-review`
+2. Push fixes → wait for new review → reassess
+3. Loop up to 3 times
+4. If still CRITICAL after 3 loops → create follow-up issue
+
+---
+
+## Per-Project `.forge/` Directory
+
+Created by `forge --init`:
+
+```
+.forge/
+├── config              # Project settings (committed)
+├── blockers.conf       # Blocker patterns (committed)
+├── assessment-prompt.md # Custom assessment context (committed, optional)
+├── .gitignore          # Ignores runtime files below
+├── scratch.md          # Working notes + security findings (gitignored)
+├── session-state/      # Session tracking JSON (gitignored)
+└── *.log               # Runtime logs (gitignored)
+```
+
+**Committed**: `config`, `blockers.conf`, `assessment-prompt.md`
+**Gitignored**: `scratch.md`, `session-state/`, `*.log`
+
+---
+
+## Troubleshooting
+
+### "AWS credentials expired"
+```bash
+aws sso login --profile your-profile
+```
+
+### "Session limit reached"
+```bash
+# Check session state
+cat .forge/session-state/current-session.json
+
+# Clear manually (auto-resets after timeout)
+rm .forge/session-state/current-session.json
+```
+
+### "Worktree limit exceeded"
+```bash
+# Auto-cleanup merged branches
+forge cleanup-worktrees
+
+# Or manual
+git worktree list
+git worktree remove /path/to/stale-worktree
+```
+
+### "Blocker detected"
+```bash
+# Resume scripts are auto-created
+.resume/resume-ISSUE_NUMBER.sh
+```
+
+### "PR review not found"
+- Ensure Claude for GitHub app is installed on the repo
+- Review may still be running (wait longer)
+- Check: `gh pr view PR_NUMBER`
+
+---
+
+## Uninstall
+
+```bash
+~/.forge/uninstall.sh
+# Or if you have the source:
+./uninstall.sh
+```
+
+Removes runtime and symlink. Prompts before removing config. Never touches project `.forge/` directories.
+
+---
+
+## Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `FORGE_WORKTREE_DIR` | Worktree base directory | `~/Dev/worktrees/$PROJECT` |
+| `FORGE_MAX_ISSUES_PER_SESSION` | Max issues per session | `8` |
+| `FORGE_MAX_SESSION_HOURS` | Max session duration (hours) | `4` |
+| `FORGE_ASSESSMENT_TIMEOUT` | Claude assessment timeout (seconds) | `120` |
+| `FORGE_AWS_PROFILE` | AWS profile for notifications | `default` |
+| `FORGE_BIN_DIR` | Override symlink location | `~/.local/bin` |
+| `SLACK_WEBHOOK_URL` | Slack webhook for notifications | — |
+| `FORGE_EMAIL_FROM` | Email sender for notifications | — |
+| `FORGE_SNS_TOPIC_ARN` | AWS SNS topic for SMS | — |

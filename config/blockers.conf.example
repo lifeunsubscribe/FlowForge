@@ -1,0 +1,46 @@
+#!/bin/bash
+# .forge/blockers.conf - Project-specific blocker path patterns
+# Place this file at $REPO_ROOT/.forge/blockers.conf
+# Uses grep -E extended regex patterns (pipe-separated alternatives).
+
+# =============================================================================
+# Infrastructure Changes (block auto-merge)
+# =============================================================================
+
+# Paths that trigger the infrastructure blocker
+# BLOCKER_INFRASTRUCTURE_PATHS="infrastructure/|cdk/|terraform/|cloudformation/"
+
+# =============================================================================
+# Database Migrations (block auto-merge)
+# =============================================================================
+
+# Paths that trigger the database migration blocker
+# BLOCKER_MIGRATION_PATHS="prisma/migrations/|migrations/|db/migrate/|alembic/"
+
+# =============================================================================
+# Authentication/Authorization (block auto-merge)
+# =============================================================================
+
+# Paths that trigger the auth change blocker (excludes tests and docs)
+# BLOCKER_AUTH_PATHS="auth/|Auth|authentication|authorization|cognito|oauth"
+
+# =============================================================================
+# Architectural Documentation (block auto-merge)
+# =============================================================================
+
+# Paths that trigger the architectural doc blocker
+# BLOCKER_DOC_PATHS="Technical-Specs|Architecture|CLAUDE.md|ARCHITECTURE.md"
+
+# =============================================================================
+# Protected Scripts (block auto-merge in unsupervised mode)
+# =============================================================================
+
+# Scripts that require manual review when changed
+# BLOCKER_PROTECTED_SCRIPTS="workflow-runner.sh|claude-workflow.sh|merge-pr.sh|create-pr.sh|batch-process-issues.sh"
+
+# =============================================================================
+# Expensive Services (block auto-merge)
+# =============================================================================
+
+# AWS/cloud services that may significantly increase costs
+# BLOCKER_EXPENSIVE_SERVICES="rds|aurora|nat|ec2|fargate|sagemaker|redshift"

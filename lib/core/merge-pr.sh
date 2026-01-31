@@ -1,0 +1,1473 @@
+#!/bin/bash
+# merge-pr.sh
+# Complete PR merge workflow with validation
+# Usage:
+#   forge merge <pr-number>   # Merge specific PR
+#   forge merge               # Merge PR for current branch
+#
+# Optional Environment Variables:
+#   SLACK_WEBHOOK - Slack webhook URL for deep clean notifications
+#                   Export in your shell: export SLACK_WEBHOOK="https://hooks.slack.com/..."
+
+set -e
+
+# Source forge configuration
+_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -z "${FORGE_LIB_DIR:-}" ]; then
+  source "$_SCRIPT_DIR/../utils/config.sh"
+fi
+
+# Source scratchpad manager
+if [ -f "$FORGE_LIB_DIR/utils/scratchpad-manager.sh" ]; then
+  source "$FORGE_LIB_DIR/utils/scratchpad-manager.sh"
+fi
+
+# Parse arguments
+AUTO_MODE=false
+PR_NUMBER=""
+for arg in "$@"; do
+  if [[ "$arg" == "--auto" ]]; then
+    AUTO_MODE=true
+  elif [[ "$arg" =~ ^[0-9]+$ ]]; then
+    PR_NUMBER="$arg"
+  fi
+done
+
+CURRENT_BRANCH=$(git branch --show-current)
+BASE_BRANCH="main"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Check dependencies
+if ! command -v gh &> /dev/null; then
+  echo -e "${RED}❌ GitHub CLI required: brew install gh${NC}"
+  exit 1
+fi
+
+if ! command -v jq &> /dev/null; then
+  echo -e "${RED}❌ jq required: brew install jq${NC}"
+  exit 1
+fi
+
+# Function to print colored messages
+print_header() {
+  echo ""
+  echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo -e "${BLUE}$1${NC}"
+  echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo ""
+}
+
+print_success() {
+  echo -e "${GREEN}✅ $1${NC}"
+}
+
+print_error() {
+  echo -e "${RED}❌ $1${NC}"
+}
+
+print_warning() {
+  echo -e "${YELLOW}⚠️  $1${NC}"
+}
+
+print_info() {
+  echo -e "${BLUE}ℹ️  $1${NC}"
+}
+
+# Helper: Add or update "Last Updated" timestamp in documentation
+update_doc_timestamp() {
+  local doc_path="$1"
+  local today=$(date +%Y-%m-%d)
+
+  if [ ! -f "$doc_path" ]; then
+    return 1
+  fi
+
+  # Check if doc already has timestamp
+  if grep -q "^> \*\*Last Updated:\*\*" "$doc_path"; then
+    # Update existing timestamp
+    sed -i.bak "s/^> \*\*Last Updated:\*\*.*/> **Last Updated:** $today (automated cleanup)/" "$doc_path"
+    rm -f "${doc_path}.bak"
+    print_success "Updated timestamp in $(basename "$doc_path")"
+  elif grep -q "^Last Updated:" "$doc_path"; then
+    # Update alternative format
+    sed -i.bak "s/^Last Updated:.*/Last Updated: $today/" "$doc_path"
+    rm -f "${doc_path}.bak"
+    print_success "Updated timestamp in $(basename "$doc_path")"
+  else
+    # Add new timestamp after first header
+    awk -v date="$today" '
+      /^# / && !timestamp_added {
+        print
+        print ""
+        print "> **Last Updated:** " date " (automated cleanup)"
+        print ""
+        timestamp_added = 1
+        next
+      }
+      { print }
+    ' "$doc_path" > "${doc_path}.tmp"
+    mv "${doc_path}.tmp" "$doc_path"
+    print_success "Added timestamp to $(basename "$doc_path")"
+  fi
+}
+
+# Update Security Development Guide from PR review findings
+update_security_guide_from_pr() {
+  local pr_number=$1
+  local security_guide="docs/security/DEVELOPMENT-GUIDE.md"
+
+  # Check if auto-update is disabled via env var
+  if [ "${SECURITY_GUIDE_AUTO_UPDATE:-true}" = "false" ]; then
+    print_info "Security guide auto-update disabled (SECURITY_GUIDE_AUTO_UPDATE=false)"
+    return 0
+  fi
+
+  # Validate PR number is numeric
+  if ! [[ "$pr_number" =~ ^[0-9]+$ ]]; then
+    print_error "Invalid PR number: $pr_number"
+    return 1
+  fi
+
+  # Check if security guide exists
+  if [ ! -f "$security_guide" ]; then
+    return 0
+  fi
+
+  # Check file size (skip if over 500KB to avoid API issues)
+  GUIDE_SIZE=$(wc -c < "$security_guide")
+  MAX_SIZE=512000  # 500KB
+  if [ "$GUIDE_SIZE" -gt "$MAX_SIZE" ]; then
+    print_warning "Security guide too large ($((GUIDE_SIZE / 1024))KB), skipping auto-update"
+    return 0
+  fi
+
+  print_info "Checking for security findings in PR #$pr_number..."
+
+  # Extract Claude review comments (check multiple possible bot names)
+  REVIEW_COMMENTS=$(gh pr view $pr_number --json comments --jq '.comments[] | select(.author.login | test("claude"; "i")) | .body' 2>/dev/null || echo "")
+
+  if [ -z "$REVIEW_COMMENTS" ]; then
+    return 0
+  fi
+
+  # Check if comments contain security findings (broader pattern matching)
+  if ! echo "$REVIEW_COMMENTS" | grep -qiE "CRITICAL|HIGH|MEDIUM|Security.*Issue|Vulnerability|Command Injection|Secret Exposure"; then
+    print_info "No security findings detected in review"
+    return 0
+  fi
+
+  print_warning "Security findings detected in PR #$pr_number"
+  print_info "Analyzing findings against existing security guide..."
+
+  # Use Claude Code to analyze and update guide
+  CLAUDE_CMD="claude"
+  if ! command -v "$CLAUDE_CMD" &> /dev/null; then
+    print_warning "Claude Code CLI not found, skipping auto-update"
+    return 0
+  fi
+
+  # Set up temp file cleanup on exit/error
+  TEMP_FILES=()
+  cleanup_temp_files() {
+    for f in "${TEMP_FILES[@]}"; do
+      rm -f "$f" 2>/dev/null || true
+    done
+  }
+  trap cleanup_temp_files EXIT ERR INT TERM
+
+  # Create analysis prompt using temp files (avoid command injection)
+  ANALYSIS_TEMP=$(mktemp)
+  TEMP_FILES+=("$ANALYSIS_TEMP")
+  cat > "$ANALYSIS_TEMP" << 'ANALYSIS_EOF'
+Analyze these security findings from PR #$PR_NUMBER against the existing Security Development Guide.
+
+PR REVIEW FINDINGS:
+ANALYSIS_EOF
+  echo "$REVIEW_COMMENTS" >> "$ANALYSIS_TEMP"
+  cat >> "$ANALYSIS_TEMP" << 'ANALYSIS_EOF'
+
+EXISTING SECURITY GUIDE:
+ANALYSIS_EOF
+  cat "$security_guide" >> "$ANALYSIS_TEMP"
+  cat >> "$ANALYSIS_TEMP" << 'ANALYSIS_EOF'
+
+For each CRITICAL, HIGH, or MEDIUM security issue found in the PR review:
+
+1. Determine if this is a NEW issue or similar to existing guide entry
+2. If NEW: Identify which category it belongs to and provide the new entry text
+3. If EXISTING: Identify which entry to update and how to expand its scope
+
+Format your response as actionable updates:
+
+### NEW: [Category Name] > [Subcategory]
+[Full markdown entry to add, including occurrences, examples, etc.]
+
+### UPDATE: [Existing entry title]
+Add to occurrences: PR #$PR_NUMBER: [file:line] - [context]
+Update example section: [any new code examples to add]
+
+Keep it precise and actionable. Only include security issues that need documentation.
+ANALYSIS_EOF
+
+  # Call Claude Code for analysis
+  CLAUDE_ERROR=$(mktemp)
+  TEMP_FILES+=("$CLAUDE_ERROR")
+  SECURITY_ANALYSIS=$("$CLAUDE_CMD" --no-cache < "$ANALYSIS_TEMP" 2>"$CLAUDE_ERROR" || echo "")
+
+  if [ -s "$CLAUDE_ERROR" ]; then
+    print_warning "Claude CLI error: $(cat "$CLAUDE_ERROR" | head -1)"
+  fi
+
+  if [ -z "$SECURITY_ANALYSIS" ]; then
+    print_warning "Claude analysis failed, skipping auto-update"
+    return 0
+  fi
+
+  # Check if Claude found actionable updates
+  if ! echo "$SECURITY_ANALYSIS" | grep -qE "^### (NEW|UPDATE):"; then
+    print_info "No actionable security guide updates identified"
+    return 0
+  fi
+
+  print_success "Security guide analysis complete"
+
+  # Apply updates using Claude Code
+  print_info "Applying updates to security guide..."
+
+  # Use temp files to avoid command injection
+  UPDATE_TEMP=$(mktemp)
+  TEMP_FILES+=("$UPDATE_TEMP")
+  cat > "$UPDATE_TEMP" << 'UPDATE_EOF'
+Apply these security guide updates to the document:
+
+UPDATES TO APPLY:
+UPDATE_EOF
+  echo "$SECURITY_ANALYSIS" >> "$UPDATE_TEMP"
+  cat >> "$UPDATE_TEMP" << 'UPDATE_EOF'
+
+CURRENT SECURITY GUIDE:
+UPDATE_EOF
+  cat "$security_guide" >> "$UPDATE_TEMP"
+  cat >> "$UPDATE_TEMP" << UPDATE_EOF
+
+Generate the COMPLETE updated security guide with:
+1. NEW entries added to appropriate categories
+2. EXISTING entries updated with new occurrences
+3. Updated timestamp: $(date +%Y-%m-%d) (PR #$pr_number)
+4. Updated total issues count
+
+Return ONLY the complete updated markdown file, nothing else.
+UPDATE_EOF
+
+  CLAUDE_ERROR2=$(mktemp)
+  TEMP_FILES+=("$CLAUDE_ERROR2")
+  UPDATED_GUIDE=$("$CLAUDE_CMD" --no-cache < "$UPDATE_TEMP" 2>"$CLAUDE_ERROR2" || echo "")
+
+  if [ -s "$CLAUDE_ERROR2" ]; then
+    print_warning "Claude CLI error: $(cat "$CLAUDE_ERROR2" | head -1)"
+  fi
+
+  if [ -z "$UPDATED_GUIDE" ]; then
+    print_warning "Auto-update failed, saving analysis for manual review"
+    echo "$SECURITY_ANALYSIS" > /tmp/security-guide-updates-pr${pr_number}.txt
+    print_info "Analysis saved to: /tmp/security-guide-updates-pr${pr_number}.txt"
+    return 0
+  fi
+
+  # Backup current guide
+  BACKUP_FILE="${security_guide}.backup-$(date +%s)"
+  cp "$security_guide" "$BACKUP_FILE"
+
+  # Cleanup old backups (keep last 5)
+  BACKUP_DIR=$(dirname "$security_guide")
+  ls -t "$BACKUP_DIR"/DEVELOPMENT-GUIDE.md.backup-* 2>/dev/null | tail -n +6 | xargs rm -f 2>/dev/null || true
+
+  # Store original size for validation
+  ORIGINAL_SIZE=$(wc -l < "$security_guide")
+
+  # Apply the updated guide
+  echo "$UPDATED_GUIDE" > "$security_guide"
+
+  # Verify the update looks reasonable (must be at least 80% of original size)
+  # Using 80% threshold to detect truncation while allowing growth
+  NEW_SIZE=$(wc -l < "$security_guide")
+  MIN_SIZE=$((ORIGINAL_SIZE * 80 / 100))
+  if [ "$NEW_SIZE" -lt "$MIN_SIZE" ]; then
+    print_error "Updated guide too short ($NEW_SIZE lines vs $ORIGINAL_SIZE original), restoring backup"
+    mv "$BACKUP_FILE" "$security_guide"
+    return 1
+  fi
+
+  git add "$security_guide"
+  git commit -m "docs: update security guide from PR #$pr_number findings" 2>/dev/null && \
+    print_success "Security guide updated and committed" || \
+    print_warning "No changes to commit"
+
+  # Display summary
+  echo ""
+  print_success "Added/updated entries from PR review:"
+  echo "$SECURITY_ANALYSIS" | grep -E "^###" | head -10
+  echo ""
+}
+
+# If no PR number provided, try to find PR for current branch
+if [ -z "$PR_NUMBER" ]; then
+  print_info "No PR number provided, searching for PR on branch: $CURRENT_BRANCH"
+
+  PR_JSON=$(gh pr list --head "$CURRENT_BRANCH" --json number,title,url --jq '.[0]' 2>/dev/null || echo "")
+
+  if [ -z "$PR_JSON" ] || [ "$PR_JSON" = "null" ]; then
+    print_error "No PR found for branch: $CURRENT_BRANCH"
+    echo ""
+    echo "Usage:"
+    echo "  forge merge <pr-number>  # Merge specific PR"
+    echo "  forge merge              # Merge PR for current branch (must have existing PR)"
+    exit 1
+  fi
+
+  PR_NUMBER=$(echo "$PR_JSON" | jq -r '.number')
+  print_success "Found PR #$PR_NUMBER for branch $CURRENT_BRANCH"
+fi
+
+if [ "$AUTO_MODE" = false ]; then
+  print_header "🔍 PR Merge Workflow - PR #$PR_NUMBER"
+fi
+
+# Fetch PR details
+if [ "$AUTO_MODE" = false ]; then
+  print_info "Fetching PR details..."
+fi
+PR_DETAILS=$(gh pr view $PR_NUMBER --json number,title,state,isDraft,mergeable,url,baseRefName,headRefName,reviews,statusCheckRollup 2>/dev/null)
+
+if [ -z "$PR_DETAILS" ]; then
+  print_error "Could not fetch PR #$PR_NUMBER"
+  exit 1
+fi
+
+# Extract PR information
+PR_TITLE=$(echo "$PR_DETAILS" | jq -r '.title')
+PR_STATE=$(echo "$PR_DETAILS" | jq -r '.state')
+PR_IS_DRAFT=$(echo "$PR_DETAILS" | jq -r '.isDraft')
+PR_MERGEABLE=$(echo "$PR_DETAILS" | jq -r '.mergeable')
+PR_URL=$(echo "$PR_DETAILS" | jq -r '.url')
+PR_BASE=$(echo "$PR_DETAILS" | jq -r '.baseRefName')
+PR_HEAD=$(echo "$PR_DETAILS" | jq -r '.headRefName')
+
+if [ "$AUTO_MODE" = false ]; then
+  print_header "📋 PR Information"
+  echo "Title: $PR_TITLE"
+  echo "Number: #$PR_NUMBER"
+  echo "URL: $PR_URL"
+  echo "State: $PR_STATE"
+  echo "Base: $PR_BASE → Head: $PR_HEAD"
+  echo "Draft: $PR_IS_DRAFT"
+  echo "Mergeable: $PR_MERGEABLE"
+fi
+
+# Validation checks
+if [ "$AUTO_MODE" = false ]; then
+  print_header "🔍 Pre-Merge Validation"
+fi
+
+VALIDATION_FAILED=false
+
+# Check 1: PR must be open
+if [ "$PR_STATE" != "OPEN" ]; then
+  print_error "PR is not open (state: $PR_STATE)"
+  VALIDATION_FAILED=true
+elif [ "$AUTO_MODE" = false ]; then
+  print_success "PR is open"
+fi
+
+# Check 2: PR must not be a draft
+if [ "$PR_IS_DRAFT" = "true" ]; then
+  print_error "PR is still in draft state"
+  VALIDATION_FAILED=true
+elif [ "$AUTO_MODE" = false ]; then
+  print_success "PR is not a draft"
+fi
+
+# Check 3: PR must be mergeable
+if [ "$PR_MERGEABLE" != "MERGEABLE" ]; then
+  print_warning "PR mergeable state: $PR_MERGEABLE"
+  if [ "$PR_MERGEABLE" = "CONFLICTING" ]; then
+    print_error "PR has merge conflicts that must be resolved"
+    VALIDATION_FAILED=true
+  else
+    print_info "Mergeable state is uncertain, will attempt merge anyway"
+  fi
+elif [ "$AUTO_MODE" = false ]; then
+  print_success "PR is mergeable"
+fi
+
+# Check 4: Status checks
+print_info "Checking status checks..."
+STATUS_CHECKS=$(echo "$PR_DETAILS" | jq -r '.statusCheckRollup // []')
+REQUIRED_CHECKS=$(echo "$STATUS_CHECKS" | jq -r '[.[] | select(.isRequired == true)]')
+REQUIRED_CHECKS_COUNT=$(echo "$REQUIRED_CHECKS" | jq 'length')
+
+if [ "$REQUIRED_CHECKS_COUNT" -gt 0 ]; then
+  echo "  Found $REQUIRED_CHECKS_COUNT required status check(s):"
+
+  echo "$REQUIRED_CHECKS" | jq -r '.[] | "  - \(.name): \(.conclusion // .status)"' | while read line; do
+    if echo "$line" | grep -q "SUCCESS"; then
+      echo -e "  ${GREEN}✓${NC} $(echo $line | sed 's/: SUCCESS//')"
+    elif echo "$line" | grep -q "FAILURE\|ERROR"; then
+      echo -e "  ${RED}✗${NC} $(echo $line | sed 's/: FAILURE//' | sed 's/: ERROR//')"
+    else
+      echo -e "  ${YELLOW}⏳${NC} $line"
+    fi
+  done
+
+  # Check for failures
+  FAILED_CHECKS=$(echo "$REQUIRED_CHECKS" | jq -r '[.[] | select(.conclusion == "FAILURE" or .conclusion == "ERROR")] | length')
+  PENDING_CHECKS=$(echo "$REQUIRED_CHECKS" | jq -r '[.[] | select(.conclusion == null or .conclusion == "PENDING")] | length')
+
+  if [ "$FAILED_CHECKS" -gt 0 ]; then
+    print_error "$FAILED_CHECKS required check(s) failed"
+    VALIDATION_FAILED=true
+  elif [ "$PENDING_CHECKS" -gt 0 ]; then
+    print_warning "$PENDING_CHECKS required check(s) still pending"
+    print_info "Waiting for checks to complete..."
+  else
+    print_success "All required checks passed"
+  fi
+else
+  print_info "No required status checks configured"
+fi
+
+# Check 5: Reviews
+print_info "Checking reviews..."
+REVIEWS=$(echo "$PR_DETAILS" | jq -r '.reviews // []')
+REVIEW_COUNT=$(echo "$REVIEWS" | jq 'length')
+
+if [ "$REVIEW_COUNT" -gt 0 ]; then
+  # Get latest review state from each reviewer
+  APPROVED_COUNT=$(echo "$REVIEWS" | jq -r '[.[] | select(.state == "APPROVED")] | length')
+  CHANGES_REQUESTED=$(echo "$REVIEWS" | jq -r '[.[] | select(.state == "CHANGES_REQUESTED")] | length')
+
+  echo "  Reviews: $REVIEW_COUNT total"
+  echo "  Approved: $APPROVED_COUNT"
+
+  if [ "$CHANGES_REQUESTED" -gt 0 ]; then
+    print_warning "$CHANGES_REQUESTED reviewer(s) requested changes"
+  fi
+
+  if [ "$APPROVED_COUNT" -eq 0 ]; then
+    print_warning "No approving reviews yet"
+  else
+    print_success "$APPROVED_COUNT approving review(s)"
+  fi
+else
+  print_warning "No reviews yet"
+fi
+
+# Check 6: Claude Code review
+print_info "Checking for Claude Code review..."
+CLAUDE_REVIEW_FOUND=false
+
+# Get latest comment from Claude user (more robust than pattern matching)
+LATEST_CLAUDE_REVIEW=$(gh pr view $PR_NUMBER --json comments \
+  --jq '[.comments[] | select(.author.login == "claude" or .author.login == "claude-code" or .author.login == "github-actions[bot]")] | .[-1] | .body' \
+  2>/dev/null)
+
+if [ -n "$LATEST_CLAUDE_REVIEW" ]; then
+  CLAUDE_REVIEW_FOUND=true
+
+  # Parse CRITICAL count using multiple patterns (case-insensitive, flexible format)
+  # Matches: "CRITICAL: 0", "Critical: 2", "CRITICAL (3)", etc.
+  CRITICAL_COUNT=$(echo "$LATEST_CLAUDE_REVIEW" | grep -oiE '(CRITICAL|critical)[[:space:]:]+\(?[0-9]+\)?' | grep -oE '[0-9]+' | head -1)
+
+  if [ -z "$CRITICAL_COUNT" ]; then
+    # Fallback: check for "### ❌ CRITICAL" sections with actual content
+    if echo "$LATEST_CLAUDE_REVIEW" | grep -q "### ❌ CRITICAL"; then
+      CRITICAL_SECTION=$(echo "$LATEST_CLAUDE_REVIEW" | sed -n '/### ❌ CRITICAL/,/###/p')
+      if echo "$CRITICAL_SECTION" | grep -q "#### "; then
+        CRITICAL_COUNT=1  # Assume at least 1 if section has content
+      else
+        CRITICAL_COUNT=0
+      fi
+    else
+      CRITICAL_COUNT=0  # No CRITICAL section found
+    fi
+  fi
+
+  if [ "$CRITICAL_COUNT" -gt 0 ]; then
+    print_error "Claude Code found $CRITICAL_COUNT CRITICAL issue(s) that must be addressed"
+    VALIDATION_FAILED=true
+  else
+    print_success "Claude Code review passed (CRITICAL: 0)"
+  fi
+else
+  print_warning "No Claude Code review found yet"
+fi
+
+# Analyze HIGH and MEDIUM issues if review exists
+if [ "$CLAUDE_REVIEW_FOUND" = true ] && [ "$CRITICAL_COUNT" -eq 0 ]; then
+  # Extract HIGH and MEDIUM issues
+  HIGH_ISSUES=$(echo "$LATEST_CLAUDE_REVIEW" | sed -n '/### HIGH Priority/,/### MEDIUM\|###.*Priority\|---/p' | grep -v "^###")
+  MEDIUM_ISSUES=$(echo "$LATEST_CLAUDE_REVIEW" | sed -n '/### MEDIUM Priority/,/### LOW\|###.*Priority\|---/p' | grep -v "^###")
+
+  HIGH_COUNT=$(echo "$LATEST_CLAUDE_REVIEW" | grep -oiE 'HIGH[[:space:]:]+\(?[0-9]+\)?' | grep -oE '[0-9]+' | head -1)
+  MEDIUM_COUNT=$(echo "$LATEST_CLAUDE_REVIEW" | grep -oiE 'MEDIUM[[:space:]:]+\(?[0-9]+\)?' | grep -oE '[0-9]+' | head -1)
+
+  if [ -n "$HIGH_COUNT" ] && [ "$HIGH_COUNT" -gt 0 ] || [ -n "$MEDIUM_COUNT" ] && [ "$MEDIUM_COUNT" -gt 0 ]; then
+    if [ "$AUTO_MODE" = false ]; then
+      print_header "📊 Issue Assessment"
+    fi
+    echo "Found HIGH: ${HIGH_COUNT:-0} | MEDIUM: ${MEDIUM_COUNT:-0}"
+    echo ""
+    echo "Analyzing whether these issues are worth investigating..."
+    echo ""
+
+    # Save review to temp file for analysis
+    REVIEW_FILE=$(mktemp)
+    echo "$LATEST_CLAUDE_REVIEW" > "$REVIEW_FILE"
+
+    # Create analysis prompt
+    ANALYSIS_PROMPT="Review the following Claude Code review findings and provide a brief assessment for each HIGH and MEDIUM issue:
+
+For each issue, provide:
+1. **Issue Name** (one line summary)
+2. **Worth Fixing?** (Yes/No/Already Fixed/Skip)
+3. **Reasoning** (2-3 sentences explaining why)
+
+Format as:
+### Issue: [Name]
+**Verdict:** [Worth Fixing/Skip/Already Fixed]
+**Reasoning:** [Brief explanation]
+
+---
+
+Review to analyze:
+$(cat "$REVIEW_FILE")
+
+Focus only on HIGH and MEDIUM priority issues. Be concise."
+
+    # Get assessment (using Claude via a simple temp file approach)
+    ASSESSMENT_FILE=$(mktemp)
+
+    # Detect Claude CLI (same detection as claude-workflow.sh)
+    CLAUDE_CMD=""
+    if command -v claude-code &> /dev/null; then
+      CLAUDE_CMD="claude-code"
+    elif command -v npx &> /dev/null; then
+      CLAUDE_CMD="npx @anthropic-ai/claude-code"
+    fi
+
+    # Try to use Claude if available, otherwise provide manual assessment prompt
+    if [ -n "$CLAUDE_CMD" ]; then
+      # Use temp file instead of pipe to avoid command injection
+      PROMPT_FILE=$(mktemp)
+      echo "$ANALYSIS_PROMPT" > "$PROMPT_FILE"
+      $CLAUDE_CMD --no-cache < "$PROMPT_FILE" > "$ASSESSMENT_FILE" 2>/dev/null || echo "Manual assessment needed" > "$ASSESSMENT_FILE"
+      rm -f "$PROMPT_FILE"
+    else
+      # Fallback: Show issues and let user decide
+      cat > "$ASSESSMENT_FILE" << EOF
+### Manual Assessment Required
+
+**HIGH Issues (${HIGH_COUNT:-0}):**
+$HIGH_ISSUES
+
+**MEDIUM Issues (${MEDIUM_COUNT:-0}):**
+$MEDIUM_ISSUES
+
+Unable to auto-analyze (Claude CLI not available).
+Review issues above and decide if fixes are needed before merge.
+EOF
+    fi
+
+    cat "$ASSESSMENT_FILE"
+    echo ""
+
+    # Cleanup temp files
+    rm -f "$REVIEW_FILE" "$ASSESSMENT_FILE"
+
+    # In auto mode, proceed with merge; in interactive mode, ask user
+    if [ "$AUTO_MODE" = false ]; then
+      echo ""
+      read -t 30 -p "Proceed with merge despite HIGH/MEDIUM issues? (y/n) " -n 1 -r || REPLY="n"
+      echo
+      if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        print_info "Merge cancelled - address issues first"
+        echo ""
+        echo "To view issues in detail:"
+          echo "  gh pr view $PR_NUMBER --web"
+        exit 0
+      fi
+    else
+      print_info "Auto mode: proceeding with merge (HIGH/MEDIUM issues are non-blocking)"
+    fi
+  fi
+fi
+
+# Summary of validation
+echo ""
+if [ "$VALIDATION_FAILED" = true ]; then
+  if [ "$AUTO_MODE" = false ]; then
+    print_header "❌ Validation Failed"
+  fi
+  echo "The following issues must be resolved before merging:"
+  echo ""
+  echo "Please address the errors above and try again."
+  echo ""
+  echo "To view PR details:"
+  echo "  gh pr view $PR_NUMBER --web"
+  exit 1
+fi
+
+if [ "$AUTO_MODE" = false ]; then
+  print_header "✅ All Validations Passed"
+fi
+
+# Documentation completeness check
+print_header "📚 Documentation Assessment"
+DOC_ASSESSMENT_SCRIPT="$FORGE_LIB_DIR/core/assess-documentation.sh"
+
+if [ -f "$DOC_ASSESSMENT_SCRIPT" ]; then
+  if [ "$AUTO_MODE" = true ]; then
+    "$DOC_ASSESSMENT_SCRIPT" "$PR_NUMBER" --auto
+  else
+    "$DOC_ASSESSMENT_SCRIPT" "$PR_NUMBER"
+  fi
+
+  DOC_EXIT_CODE=$?
+
+  if [ $DOC_EXIT_CODE -ne 0 ]; then
+    # Assessment script failed
+    print_warning "Documentation assessment failed (error code $DOC_EXIT_CODE)"
+    if [ "$AUTO_MODE" = true ]; then
+      print_warning "Auto mode: proceeding with merge (docs can be updated manually)"
+    else
+      read -p "Continue with merge anyway? (y/N): " CONTINUE
+      if [[ ! "$CONTINUE" =~ ^[Yy]$ ]]; then
+        print_info "Merge cancelled"
+        exit 0
+      fi
+    fi
+  fi
+else
+  print_warning "Documentation assessment script not found: $DOC_ASSESSMENT_SCRIPT"
+  print_info "Skipping documentation check"
+fi
+
+# Confirm merge
+if [ "$AUTO_MODE" = false ]; then
+  echo ""
+  echo "Ready to merge PR #$PR_NUMBER:"
+  echo "  $PR_TITLE"
+  echo ""
+  read -p "Proceed with merge? (y/n) " -n 1 -r
+  echo
+  if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    print_info "Merge cancelled"
+    exit 0
+  fi
+
+  # Analyze PR characteristics for merge strategy recommendation
+  COMMIT_COUNT=$(gh pr view $PR_NUMBER --json commits --jq '.commits | length' 2>/dev/null || echo "1")
+  CHANGED_FILES=$(gh pr view $PR_NUMBER --json files --jq '.files | length' 2>/dev/null || echo "0")
+  PR_LABELS=$(gh pr view $PR_NUMBER --json labels --jq '[.labels[].name] | join(",")' 2>/dev/null || echo "")
+
+  # Determine recommendation
+  RECOMMENDED_STRATEGY=1  # Default to squash
+  RECOMMENDATION_REASON="Clean single commit"
+
+  if [ "$COMMIT_COUNT" -gt 10 ] && echo "$PR_LABELS" | grep -qiE "(refactor|feature)"; then
+    RECOMMENDED_STRATEGY=2
+    RECOMMENDATION_REASON="Large feature - preserve commit history"
+  elif [ "$COMMIT_COUNT" -eq 1 ]; then
+    RECOMMENDED_STRATEGY=1
+    RECOMMENDATION_REASON="Single commit - squash keeps history clean"
+  elif echo "$PR_LABELS" | grep -qiE "(hotfix|fix)" && [ "$COMMIT_COUNT" -le 3 ]; then
+    RECOMMENDED_STRATEGY=1
+    RECOMMENDATION_REASON="Quick fix - squash for cleaner history"
+  elif echo "$PR_TITLE" | grep -qiE "^(feat|feature):" && [ "$COMMIT_COUNT" -gt 5 ]; then
+    RECOMMENDED_STRATEGY=2
+    RECOMMENDATION_REASON="Feature with detailed commit history"
+  fi
+
+  # Merge strategy prompt with smart recommendation
+  echo ""
+  echo "Select merge strategy:"
+  echo ""
+  echo "PR Stats: $COMMIT_COUNT commits, $CHANGED_FILES files changed"
+  echo ""
+  if [ "$RECOMMENDED_STRATEGY" -eq 1 ]; then
+    echo "  1) Squash and merge ⭐ RECOMMENDED"
+    echo "     → $RECOMMENDATION_REASON"
+  else
+    echo "  1) Squash and merge"
+    echo "     → Clean single commit"
+  fi
+  echo ""
+  if [ "$RECOMMENDED_STRATEGY" -eq 2 ]; then
+    echo "  2) Merge commit ⭐ RECOMMENDED"
+    echo "     → $RECOMMENDATION_REASON"
+  else
+    echo "  2) Merge commit"
+    echo "     → Preserves all commits"
+  fi
+  echo ""
+  if [ "$RECOMMENDED_STRATEGY" -eq 3 ]; then
+    echo "  3) Rebase and merge ⭐ RECOMMENDED"
+    echo "     → $RECOMMENDATION_REASON"
+  else
+    echo "  3) Rebase and merge"
+    echo "     → Linear history"
+  fi
+  echo ""
+  read -p "Enter choice (1-3) [$RECOMMENDED_STRATEGY]: " MERGE_STRATEGY
+
+  MERGE_STRATEGY=${MERGE_STRATEGY:-$RECOMMENDED_STRATEGY}
+else
+  # Auto mode: use squash by default
+  print_info "Auto mode: using squash merge"
+  MERGE_STRATEGY=1
+fi
+
+case $MERGE_STRATEGY in
+  1)
+    MERGE_METHOD="squash"
+    print_info "Using squash merge"
+    ;;
+  2)
+    MERGE_METHOD="merge"
+    print_info "Using merge commit"
+    ;;
+  3)
+    MERGE_METHOD="rebase"
+    print_info "Using rebase merge"
+    ;;
+  *)
+    print_warning "Invalid choice, defaulting to squash"
+    MERGE_METHOD="squash"
+    ;;
+esac
+
+# Perform merge
+if [ "$AUTO_MODE" = false ]; then
+  print_header "🚀 Merging PR #$PR_NUMBER"
+fi
+
+# Merge without --delete-branch flag (we'll handle branch cleanup manually)
+# This prevents gh CLI from trying to delete a branch that's checked out in a worktree
+MERGE_OUTPUT=$(gh pr merge $PR_NUMBER --$MERGE_METHOD 2>&1)
+MERGE_EXIT_CODE=$?
+
+if [ $MERGE_EXIT_CODE -eq 0 ]; then
+  if [ "$AUTO_MODE" = false ]; then
+    print_header "✅ PR Merged Successfully"
+  fi
+
+  echo "Merge completed!"
+  echo ""
+  print_success "Branch $PR_HEAD has been merged into $PR_BASE"
+
+  # Clear "Current Work" section in scratchpad (merge complete)
+  if type clear_current_work &>/dev/null; then
+    clear_current_work
+  fi
+
+  # Delete remote branch manually (since we didn't use --delete-branch flag)
+  echo ""
+  print_info "Cleaning up remote branch..."
+  sleep 2  # Give GitHub a moment to process the merge
+
+  if git ls-remote --heads origin "$PR_HEAD" 2>/dev/null | grep -q "$PR_HEAD"; then
+    if git push origin --delete "$PR_HEAD" 2>/dev/null; then
+      print_success "✓ Remote branch deleted: origin/$PR_HEAD"
+    else
+      print_warning "Could not delete remote branch (may require permissions)"
+    fi
+  else
+    print_success "✓ Remote branch already deleted: origin/$PR_HEAD"
+  fi
+
+  # Check for local branch
+  if git show-ref --verify --quiet refs/heads/"$PR_HEAD"; then
+    print_info "✓ Local branch still exists: $PR_HEAD (will be cleaned up below)"
+  else
+    print_success "✓ Local branch already deleted: $PR_HEAD"
+  fi
+
+  echo ""
+  print_info "📚 Branch cleanup explained:"
+  echo "   • Local branch: Lives on your machine only"
+  echo "   • Remote branch: Lives on GitHub (origin/$PR_HEAD)"
+  echo "   • Both are deleted after merge to keep repo clean"
+
+  # Check for security findings and update guide
+  update_security_guide_from_pr "$PR_NUMBER"
+
+  # Update scratchpad with security findings (BEFORE clearing context)
+  if type update_scratchpad_from_pr &>/dev/null; then
+    PR_TITLE=$(gh pr view $PR_NUMBER --json title --jq '.title' 2>/dev/null || echo "PR #$PR_NUMBER")
+    update_scratchpad_from_pr "$PR_NUMBER" "$PR_TITLE"
+  fi
+
+  # Extract issue number from PR if it exists
+  ISSUE_NUMBER=$(gh pr view $PR_NUMBER --json body --jq '.body' | sed -n 's/.*Closes #\([0-9]\+\).*/\1/p' | head -1 || echo "")
+
+  if [ ! -z "$ISSUE_NUMBER" ]; then
+    if [ "$AUTO_MODE" = false ]; then
+      print_info "This PR closes issue #$ISSUE_NUMBER"
+      echo ""
+      read -p "Close linked issue #$ISSUE_NUMBER? (y/n) " -n 1 -r
+      echo
+      if [[ $REPLY =~ ^[Yy]$ ]]; then
+        gh issue close $ISSUE_NUMBER --comment "Closed by PR #$PR_NUMBER" 2>/dev/null
+        print_success "Issue #$ISSUE_NUMBER closed"
+      fi
+    else
+      # Auto mode: automatically close linked issue
+      print_info "Auto mode: closing linked issue #$ISSUE_NUMBER"
+      gh issue close $ISSUE_NUMBER --comment "Closed by PR #$PR_NUMBER" 2>/dev/null
+      print_success "Issue #$ISSUE_NUMBER closed"
+    fi
+  fi
+
+  # Create follow-up issues from review "skip" items
+  if [ -f "$FORGE_LIB_DIR/utils/create-followup-issues.sh" ]; then
+    source "$FORGE_LIB_DIR/utils/create-followup-issues.sh"
+
+    if [ "$AUTO_MODE" = false ]; then
+      print_header "📋 Creating Follow-up Issues"
+    fi
+    print_info "Checking review for items to track..."
+    echo ""
+
+    create_followup_issues "$PR_NUMBER" "$PR_TITLE"
+
+    if [ "$ISSUES_CREATED_COUNT" -gt 0 ]; then
+      echo ""
+      print_success "Created $ISSUES_CREATED_COUNT follow-up issue(s) from code review"
+
+      # Send Slack notification with created issues
+      if [ -n "${SLACK_WEBHOOK:-}" ]; then
+        # Build issues list for Slack
+        ISSUES_LIST=""
+        for issue_num in $ISSUES_CREATED; do
+          ISSUE_TITLE=$(gh issue view "$issue_num" --json title --jq '.title' 2>/dev/null || echo "Issue #$issue_num")
+          REPO_URL=$(gh repo view --json url --jq '.url' 2>/dev/null || echo "")
+          ISSUES_LIST="${ISSUES_LIST}• <${REPO_URL}/issues/${issue_num}|#${issue_num}>: ${ISSUE_TITLE}\n"
+        done
+
+        MERGE_NOTIFICATION="🎯 *PR #${PR_NUMBER} Merged Successfully*
+
+✅ ${PR_TITLE}
+
+📋 *Follow-up Issues Created* (${ISSUES_CREATED_COUNT}):
+${ISSUES_LIST}
+🔗 *PR Link*: <${PR_URL}|View PR #${PR_NUMBER}>"
+
+        SLACK_PAYLOAD=$(cat <<EOF
+{
+  "text": "PR #${PR_NUMBER} Merged",
+  "blocks": [
+    {
+      "type": "section",
+      "text": {
+        "type": "mrkdwn",
+        "text": "$MERGE_NOTIFICATION"
+      }
+    },
+    {
+      "type": "context",
+      "elements": [
+        {
+          "type": "mrkdwn",
+          "text": "Repository: \`${FORGE_PROJECT_NAME}\` | Branch: \`${PR_HEAD}\` → \`${PR_BASE}\`"
+        }
+      ]
+    }
+  ]
+}
+EOF
+)
+
+        HTTP_CODE=$(curl -X POST "$SLACK_WEBHOOK" \
+          -H "Content-Type: application/json" \
+          -d "$SLACK_PAYLOAD" \
+          -w "%{http_code}" \
+          -s -o /dev/null 2>/dev/null || echo "000")
+
+        if [ "$HTTP_CODE" = "200" ]; then
+          print_success "Slack notification sent"
+        else
+          print_warning "Slack notification failed (HTTP $HTTP_CODE)"
+        fi
+      fi
+    else
+      print_info "No follow-up issues needed (all review items addressed)"
+    fi
+  fi
+
+  # Cleanup local branch if it exists
+  if [ "$CURRENT_BRANCH" = "$PR_HEAD" ]; then
+    print_info "You are currently on the merged branch"
+    echo ""
+    read -p "Switch to $PR_BASE and delete local branch? (y/n) " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+      git checkout $PR_BASE
+      git pull origin $PR_BASE
+      git branch -D $PR_HEAD 2>/dev/null || true
+      print_success "Switched to $PR_BASE and deleted local branch"
+    fi
+  elif git branch --list | grep -q "^  $PR_HEAD\$"; then
+    print_info "Local branch $PR_HEAD still exists"
+    echo ""
+    read -p "Delete local branch? (y/n) " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+      git branch -D $PR_HEAD 2>/dev/null || true
+      print_success "Local branch deleted"
+    fi
+  fi
+
+  # Pop stash if there are stashed changes (from claude-workflow.sh)
+  if git stash list | grep -q "Auto-stash before claude-workflow.sh"; then
+    print_info "Restoring stashed changes..."
+    if git stash pop; then
+      print_success "Stashed changes restored"
+    else
+      print_warning "Stash pop failed - you may need to resolve conflicts manually"
+      echo "Run: git stash pop"
+    fi
+  fi
+
+  # Cleanup worktree if running from one
+  CURRENT_DIR=$(pwd)
+  if git worktree list | grep -q "$CURRENT_DIR"; then
+    MAIN_WORKTREE=$(git worktree list | head -1 | awk '{print $1}')
+
+    if [ "$CURRENT_DIR" != "$MAIN_WORKTREE" ]; then
+      print_info "Cleaning up worktree: $CURRENT_DIR"
+
+      # Clean up only this branch's notes from shared scratchpad
+      if [ -f "$SCRATCHPAD_FILE" ]; then
+        print_info "Cleaning up notes for branch: $PR_HEAD..."
+
+        # Create backup before modification
+        SCRATCHPAD_BACKUP="${SCRATCHPAD_FILE}.backup-$(date +%s)"
+        cp "$SCRATCHPAD_FILE" "$SCRATCHPAD_BACKUP"
+
+        # Use file locking to prevent concurrent modification
+        LOCKFILE="${SCRATCHPAD_FILE}.lock"
+        exec 200>"$LOCKFILE"
+        if ! flock -n 200; then
+          print_warning "Scratchpad locked by another process, waiting..."
+          flock 200  # Wait for lock
+        fi
+
+        # Create temp file for cleaned scratchpad
+        TEMP_SCRATCH=$(mktemp)
+
+        # Remove only sections tagged with this branch, keep everything else
+        awk -v branch="$PR_HEAD" '
+          # Track if we are inside this branchs section
+          /^### Branch:/ {
+            if ($3 == branch) {
+              in_target_branch = 1
+              next
+            } else {
+              in_target_branch = 0
+            }
+          }
+
+          # Skip lines in target branch section until next ### or ##
+          in_target_branch && /^###/ { in_target_branch = 0 }
+          in_target_branch && /^##/ { in_target_branch = 0 }
+          in_target_branch { next }
+
+          # Print everything else
+          { print }
+        ' "$SCRATCHPAD_FILE" > "$TEMP_SCRATCH"
+
+        # Add archive entry for this completed branch
+        # Insert before "## Completed Work Archive" or at end
+        if grep -q "^## Completed Work Archive" "$TEMP_SCRATCH"; then
+          # Insert entry at top of archive section
+          ARCHIVE_ENTRY=$(cat << EOF
+
+### $(date +%Y-%m-%d): PR #$PR_NUMBER Merged
+**Branch:** $PR_HEAD → $PR_BASE
+**Title:** $(echo "$PR_TITLE" | head -c 80)
+**Status:** Merged successfully
+
+---
+EOF
+)
+          # Use awk to insert after "## Completed Work Archive" header
+          awk -v entry="$ARCHIVE_ENTRY" '
+            /^## Completed Work Archive/ { print; print entry; next }
+            { print }
+          ' "$TEMP_SCRATCH" > "$TEMP_SCRATCH.2"
+          mv "$TEMP_SCRATCH.2" "$TEMP_SCRATCH"
+        else
+          # Create archive section
+          cat >> "$TEMP_SCRATCH" << EOF
+
+---
+
+## Completed Work Archive
+
+### $(date +%Y-%m-%d): PR #$PR_NUMBER Merged
+**Branch:** $PR_HEAD → $PR_BASE
+**Title:** $(echo "$PR_TITLE" | head -c 80)
+**Status:** Merged successfully
+
+---
+
+EOF
+        fi
+
+        # Replace scratchpad with cleaned version
+        mv "$TEMP_SCRATCH" "$SCRATCHPAD_FILE"
+        print_success "Scratchpad cleaned (removed notes for $PR_HEAD, kept other branches)"
+
+        # Check if deep clean is needed (shared sections)
+        SCRATCHPAD_SIZE=$(wc -c < "$SCRATCHPAD_FILE" 2>/dev/null || echo "0")
+        LAST_DEEP_CLEAN=$(sed -n 's/.*<!-- last_deep_clean=\([0-9-]\+\).*/\1/p' "$SCRATCHPAD_FILE" 2>/dev/null | head -1 || echo "1970-01-01")
+        DAYS_SINCE_CLEAN=$(( ( $(date +%s) - $(date -d "$LAST_DEEP_CLEAN" +%s 2>/dev/null || date -j -f "%Y-%m-%d" "$LAST_DEEP_CLEAN" +%s 2>/dev/null || echo 0) ) / 86400 ))
+
+        SHOULD_DEEP_CLEAN=false
+        DEEP_CLEAN_REASON=""
+
+        # Check if there have been commits in last 2 weeks
+        RECENT_COMMITS=$(git log --since="14 days ago" --oneline 2>/dev/null | wc -l)
+
+        # Check conditions for deep clean
+        if [ "$SCRATCHPAD_SIZE" -gt 51200 ]; then  # >50KB
+          SHOULD_DEEP_CLEAN=true
+          DEEP_CLEAN_REASON="scratchpad size ($(( SCRATCHPAD_SIZE / 1024 ))KB > 50KB)"
+        elif [ "$DAYS_SINCE_CLEAN" -gt 14 ] && [ "$RECENT_COMMITS" -gt 0 ]; then  # >14 days + active development
+          SHOULD_DEEP_CLEAN=true
+          DEEP_CLEAN_REASON="last deep clean was $DAYS_SINCE_CLEAN days ago (${RECENT_COMMITS} commits in last 2 weeks)"
+        elif [ "$DAYS_SINCE_CLEAN" -gt 14 ] && [ "$RECENT_COMMITS" -eq 0 ]; then
+          print_info "Skipping deep clean: no commits in last 2 weeks (project idle)"
+        fi
+
+        if [ "$SHOULD_DEEP_CLEAN" = true ]; then
+          echo ""
+          print_warning "Deep clean triggered: $DEEP_CLEAN_REASON"
+          print_info "Performing automated deep clean..."
+          echo ""
+
+          DEEP_CLEAN_TEMP=$(mktemp)
+          TODAY=$(date +%Y-%m-%d)
+          CUTOFF_30=$(date -d "30 days ago" +%Y-%m-%d 2>/dev/null || date -v-30d +%Y-%m-%d 2>/dev/null)
+          CUTOFF_60=$(date -d "60 days ago" +%Y-%m-%d 2>/dev/null || date -v-60d +%Y-%m-%d 2>/dev/null)
+          CUTOFF_90=$(date -d "90 days ago" +%Y-%m-%d 2>/dev/null || date -v-90d +%Y-%m-%d 2>/dev/null)
+
+          # Add metadata
+          echo "<!-- last_deep_clean=$TODAY, merge_count=$PR_NUMBER -->" > "$DEEP_CLEAN_TEMP"
+          echo "" >> "$DEEP_CLEAN_TEMP"
+
+          # Process scratchpad sections intelligently
+          awk -v cutoff_30="$CUTOFF_30" -v cutoff_60="$CUTOFF_60" -v cutoff_90="$CUTOFF_90" '
+            BEGIN {
+              in_archive = 0
+              archive_count = 0
+              old_entries = ""
+            }
+
+            # Keep header and HIGH PRIORITY as-is (user manages this manually)
+            /^# Claude Code Scratchpad/,/^## 🔥 HIGH PRIORITY/ { print; next }
+            /^## 🔥 HIGH PRIORITY/,/^##/ {
+              if (/^##/ && !/^## 🔥 HIGH PRIORITY/) {
+                # End of HIGH PRIORITY section
+              } else {
+                print
+                next
+              }
+            }
+
+            # Keep Current Work section as-is (active branches)
+            /^## Current Work/,/^##/ {
+              if (/^##/ && !/^## Current Work/) {
+                # End of Current Work
+              } else {
+                print
+                next
+              }
+            }
+
+            # Keep Project Notes, Useful Commands, References as-is for now
+            # (Manual curation is better for these)
+            /^## Project Notes/,/^## Completed Work Archive/ { print; next }
+            /^## Useful Commands/,/^##/ {
+              if (/^##/ && !/^## Useful Commands/) {
+              } else { print; next }
+            }
+            /^## References/,/^##/ {
+              if (/^##/ && !/^## References/) {
+              } else { print; next }
+            }
+
+            # Completed Work Archive: keep last 20, summarize older
+            /^## Completed Work Archive/ {
+              in_archive = 1
+              print
+              print ""
+              next
+            }
+
+            in_archive && /^### [0-9]{4}-[0-9]{2}-[0-9]{2}:/ {
+              archive_count++
+              if (archive_count <= 20) {
+                # Keep recent entries
+                entry = $0
+                while (getline > 0) {
+                  if (/^###/ || /^##/) {
+                    # Next section
+                    print entry
+                    print ""
+                    in_archive = 0
+                    break
+                  }
+                  entry = entry "\n" $0
+                }
+                if (in_archive) print entry
+              } else {
+                # Skip old entries (could summarize later)
+                while (getline > 0) {
+                  if (/^###/ || /^##/) {
+                    in_archive = 0
+                    break
+                  }
+                }
+              }
+              next
+            }
+
+            # Print everything else
+            { print }
+          ' "$SCRATCHPAD_FILE" >> "$DEEP_CLEAN_TEMP"
+
+          # Show summary of what was removed
+          ORIGINAL_LINES=$(wc -l < "$SCRATCHPAD_FILE")
+          NEW_LINES=$(wc -l < "$DEEP_CLEAN_TEMP")
+          REMOVED_LINES=$(( ORIGINAL_LINES - NEW_LINES ))
+
+          mv "$DEEP_CLEAN_TEMP" "$SCRATCHPAD_FILE"
+          print_success "Deep clean complete (removed $REMOVED_LINES lines, kept last 20 archived PRs)"
+          echo "   New size: $(( $(wc -c < "$SCRATCHPAD_FILE") / 1024 ))KB"
+
+          # Check HIGH PRIORITY completion status
+          print_info "Checking HIGH PRIORITY items completion status..."
+
+          HIGH_PRIORITY=$(sed -n '/^## 🔥 HIGH PRIORITY/,/^## /p' "$SCRATCHPAD_FILE" | sed '$d')
+
+          if [ -n "$HIGH_PRIORITY" ]; then
+            # Check each item against git history
+            # Extract item titles and check if corresponding PRs merged
+              while IFS= read -r line; do
+                if [[ "$line" =~ ^###[[:space:]](.+) ]]; then
+                  ITEM_TITLE="${BASH_REMATCH[1]}"
+                  # Check if this was completed (look for PR in git log)
+                  RELATED_PR=$(git log --all --grep="$ITEM_TITLE" --oneline -1 2>/dev/null)
+                  if [ -n "$RELATED_PR" ]; then
+                    print_info "Found completed: $ITEM_TITLE (may need status update)"
+                  fi
+                fi
+              done <<< "$HIGH_PRIORITY"
+            fi
+          fi
+
+          # Step 4: Clean up stale worktrees
+          print_info "Checking for stale worktrees..."
+
+          EXISTING_WORKTREES=$(git worktree list --porcelain | grep -E "^worktree $FORGE_WORKTREE_DIR" | sed 's/^worktree //' || echo "")
+
+          STALE_COUNT=0
+          REMOVED_COUNT=0
+          REMOVED_BRANCHES=()
+
+          if [ -n "$EXISTING_WORKTREES" ]; then
+            while IFS= read -r wt_path; do
+              [ -z "$wt_path" ] && continue
+
+              WT_BRANCH=$(git -C "$wt_path" branch --show-current 2>/dev/null || echo "unknown")
+              UNCOMMITTED_COUNT=$(git -C "$wt_path" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+
+              # Check if branch has been merged/deleted
+              BRANCH_EXISTS=$(git show-ref --verify --quiet refs/heads/"$WT_BRANCH" && echo "yes" || echo "no")
+
+              # Check last modification
+              LAST_MODIFIED=$(find "$wt_path" -type f \( -name "*.ts" -o -name "*.js" \) 2>/dev/null | xargs stat -f "%m %N" 2>/dev/null | sort -rn | head -1 | awk '{print $1}')
+
+              if [ -n "$LAST_MODIFIED" ]; then
+                DAYS_OLD=$(( ( $(date +%s) - LAST_MODIFIED ) / 86400 ))
+              else
+                DAYS_OLD=999
+              fi
+
+              IS_STALE=false
+              STALE_REASON=""
+
+              # Determine if stale (same logic as cleanup-worktrees.sh)
+              if [ "$BRANCH_EXISTS" = "no" ]; then
+                IS_STALE=true
+                STALE_REASON="Branch deleted/merged"
+              elif [ "$UNCOMMITTED_COUNT" -eq 0 ] && [ "$DAYS_OLD" -gt 14 ]; then
+                IS_STALE=true
+                STALE_REASON="No activity for $DAYS_OLD days"
+              fi
+
+              if [ "$IS_STALE" = true ]; then
+                STALE_COUNT=$((STALE_COUNT + 1))
+                print_info "Removing stale worktree: $(basename "$wt_path") ($STALE_REASON)"
+
+                # Stash any uncommitted changes (safety check)
+                UNCOMMITTED=$(git -C "$wt_path" status --porcelain 2>/dev/null || echo "")
+                if [ -n "$UNCOMMITTED" ]; then
+                  git -C "$wt_path" stash push -m "Auto-stash before cleanup: $WT_BRANCH - $(date +%Y-%m-%d)" 2>/dev/null || true
+                fi
+
+                # Remove worktree
+                if git worktree remove "$wt_path" --force 2>/dev/null || git worktree remove "$wt_path" 2>/dev/null; then
+                  REMOVED_COUNT=$((REMOVED_COUNT + 1))
+                  REMOVED_BRANCHES+=("$WT_BRANCH ($STALE_REASON)")
+                fi
+              fi
+            done <<< "$EXISTING_WORKTREES"
+
+            if [ "$REMOVED_COUNT" -gt 0 ]; then
+              print_success "Removed $REMOVED_COUNT stale worktree(s)"
+            else
+              print_success "No stale worktrees to clean"
+            fi
+          fi
+
+          # Step 5: Send Slack notification summary
+          if [ -n "${SLACK_WEBHOOK:-}" ]; then
+            print_info "Sending deep clean summary to Slack..."
+
+            # Calculate totals
+            SCRATCHPAD_LINES_REMOVED=$(( ORIGINAL_LINES - NEW_LINES ))
+
+            # Build removed worktrees list
+            REMOVED_WORKTREES_LIST=""
+            if [ ${#REMOVED_BRANCHES[@]} -gt 0 ]; then
+              for branch_info in "${REMOVED_BRANCHES[@]}"; do
+                REMOVED_WORKTREES_LIST="${REMOVED_WORKTREES_LIST}  ◦ ${branch_info}\n"
+              done
+            else
+              REMOVED_WORKTREES_LIST="  ◦ None\n"
+            fi
+
+            # Build active worktrees list
+            ACTIVE_WORKTREES_LIST=""
+
+            # Re-scan to get current active worktrees
+            CURRENT_WORKTREES=$(git worktree list --porcelain | grep -E "^worktree $FORGE_WORKTREE_DIR" | sed 's/^worktree //' || echo "")
+            if [ -n "$CURRENT_WORKTREES" ]; then
+              while IFS= read -r wt_path; do
+                [ -z "$wt_path" ] && continue
+                WT_BRANCH=$(git -C "$wt_path" branch --show-current 2>/dev/null || echo "unknown")
+                ACTIVE_WORKTREES_LIST="${ACTIVE_WORKTREES_LIST}  ◦ ${WT_BRANCH}\n"
+              done <<< "$CURRENT_WORKTREES"
+            else
+              ACTIVE_WORKTREES_LIST="  ◦ None\n"
+            fi
+
+            # Build summary message
+            CLEAN_SUMMARY="🧹 *Periodic Deep Clean Complete*
+
+📝 *Scratchpad*
+• Removed $SCRATCHPAD_LINES_REMOVED lines
+• Size: $(( $(wc -c < "$SCRATCHPAD_FILE") / 1024 ))KB
+• Kept last 20 archived PRs
+
+🌳 *Worktrees*
+• Removed ($REMOVED_COUNT):
+${REMOVED_WORKTREES_LIST}
+• Active ($(echo "$ACTIVE_WORKTREES_LIST" | grep -c '◦' || echo 0)):
+${ACTIVE_WORKTREES_LIST}
+📦 *Backups*
+• Scratchpad backup: $(basename "$SCRATCHPAD_BACKUP")
+• Kept last 5 backups
+
+⏰ Last deep clean: $TODAY
+📊 Total PRs merged: #$PR_NUMBER"
+
+            # Send to Slack
+            SLACK_PAYLOAD=$(cat <<EOF
+{
+  "text": "Periodic Deep Clean Summary",
+  "blocks": [
+    {
+      "type": "section",
+      "text": {
+        "type": "mrkdwn",
+        "text": "$CLEAN_SUMMARY"
+      }
+    },
+    {
+      "type": "context",
+      "elements": [
+        {
+          "type": "mrkdwn",
+          "text": "Repository: \`${FORGE_PROJECT_NAME}\` | Triggered by PR #$PR_NUMBER merge"
+        }
+      ]
+    }
+  ]
+}
+EOF
+)
+
+            HTTP_CODE=$(curl -X POST "$SLACK_WEBHOOK" \
+              -H "Content-Type: application/json" \
+              -d "$SLACK_PAYLOAD" \
+              -w "%{http_code}" \
+              -s -o /dev/null 2>/dev/null || echo "000")
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            print_success "Slack notification sent"
+          else
+            print_warning "Slack notification failed (HTTP $HTTP_CODE)"
+          fi
+        fi
+      fi
+
+      # Release file lock
+        flock -u 200 2>/dev/null || true
+        exec 200>&-
+
+        # Clean up old backups (keep last 5)
+        SCRATCHPAD_DIR=$(dirname "$SCRATCHPAD_FILE")
+        SCRATCHPAD_BASENAME=$(basename "$SCRATCHPAD_FILE")
+        find "$SCRATCHPAD_DIR" -name "${SCRATCHPAD_BASENAME}.backup-*" -type f 2>/dev/null | sort -r | tail -n +6 | xargs rm -f 2>/dev/null || true
+        print_success "Scratchpad backup created: $(basename "$SCRATCHPAD_BACKUP")"
+      fi
+
+      # Clean up worktree for reuse (don't delete it)
+      print_info "Cleaning worktree for future reuse..."
+
+      cd "$CURRENT_DIR"
+      UNCOMMITTED=$(git status --porcelain 2>/dev/null || echo "")
+
+      if [ -n "$UNCOMMITTED" ]; then
+        echo ""
+        print_warning "Worktree has uncommitted changes - categorizing for cleanup:"
+        echo ""
+
+        # Categorize changes
+        TESTING_ARTIFACTS=$(echo "$UNCOMMITTED" | grep -E '(coverage/|\.test-results/|\.nyc_output/|test-results\.xml)' || echo "")
+        DEPENDENCIES=$(echo "$UNCOMMITTED" | grep -E '(package\.json|package-lock\.json|node_modules/)' || echo "")
+        AWS_TEST=$(echo "$UNCOMMITTED" | grep -E '(\.env\.test|\.aws/|credentials)' || echo "")
+        OTHER=$(echo "$UNCOMMITTED" | grep -vE '(coverage/|\.test-results/|package\.json|package-lock\.json|node_modules/|\.env\.test|\.aws/)' || echo "")
+
+        # Show categorized changes
+        if [ -n "$TESTING_ARTIFACTS" ]; then
+          echo "📊 Testing artifacts (will be discarded):"
+          echo "$TESTING_ARTIFACTS" | sed 's/^/  /'
+          echo ""
+        fi
+
+        if [ -n "$DEPENDENCIES" ]; then
+          echo "📦 Dependency changes (will be stashed):"
+          echo "$DEPENDENCIES" | sed 's/^/  /'
+          echo ""
+        fi
+
+        if [ -n "$AWS_TEST" ]; then
+          echo "☁️  AWS test configuration (will be stashed):"
+          echo "$AWS_TEST" | sed 's/^/  /'
+          echo ""
+        fi
+
+        if [ -n "$OTHER" ]; then
+          echo "📝 Other uncommitted files (will be stashed):"
+          echo "$OTHER" | sed 's/^/  /'
+          echo ""
+        fi
+
+        # Auto-clean testing artifacts
+        if [ -n "$TESTING_ARTIFACTS" ]; then
+          echo "$TESTING_ARTIFACTS" | while read -r line; do
+            file=$(echo "$line" | awk '{print $2}')
+            rm -rf "$file" 2>/dev/null || true
+          done
+          print_info "Discarded testing artifacts"
+        fi
+
+        # Stash everything else
+        STASH_MSG="Worktree auto-cleanup: $PR_HEAD (PR #$PR_NUMBER) - $(date +%Y-%m-%d)"
+        if git stash push -m "$STASH_MSG" 2>/dev/null; then
+          print_success "Stashed remaining changes: $STASH_MSG"
+        fi
+      fi
+
+      # Switch back to main branch in this worktree (ready for next use)
+      git checkout main 2>/dev/null || git checkout master 2>/dev/null || true
+
+      # Return to main worktree
+      cd "$MAIN_WORKTREE"
+      echo ""
+      if [ "$AUTO_MODE" = false ]; then
+        print_header "📁 Worktree Cleanup Complete"
+      fi
+      print_success "✓ Switched from worktree to main repository"
+      print_success "✓ Worktree cleaned and ready for reuse"
+      echo ""
+      print_info "Current location: $MAIN_WORKTREE"
+      print_info "Worktree still exists at: $CURRENT_DIR (ready for next feature)"
+      echo ""
+      print_info "💡 Worktree explained:"
+      echo "   • This PR's work is done and merged"
+      echo "   • You're now back in the main repo (not the worktree)"
+      echo "   • The worktree directory still exists for future use"
+      echo "   • Use forge to create new feature worktrees"
+      CURRENT_DIR="$MAIN_WORKTREE"
+    fi
+
+  if [ "$AUTO_MODE" = false ]; then
+    print_header "🎉 Merge Complete"
+  fi
+  echo "Summary:"
+  echo "  ✓ PR #$PR_NUMBER merged into $PR_BASE"
+  echo "  ✓ Remote branch deleted: origin/$PR_HEAD"
+  echo "  ✓ Local branch deleted: $PR_HEAD"
+  echo "  ✓ Security guide updated (if applicable)"
+  echo "  ✓ Scratchpad cleaned"
+  echo ""
+  echo "Next steps:"
+  echo "  1. Verify deployment if applicable"
+  echo "  2. Monitor for any issues"
+  echo "  3. Update project board if using one"
+  echo ""
+  echo "PR URL: $PR_URL"
+  echo ""
+
+  exit 0
+else
+  if [ "$AUTO_MODE" = false ]; then
+    print_header "❌ Merge Failed"
+  fi
+  echo ""
+  echo "Error output:"
+  echo "$MERGE_OUTPUT"
+  echo ""
+  echo "Possible reasons:"
+  echo "  - Branch protection rules blocking merge"
+  echo "  - Required reviews not met"
+  echo "  - Status checks still pending"
+  echo "  - Merge conflicts detected"
+  echo ""
+  echo "To debug:"
+  echo "  gh pr view $PR_NUMBER --web"
+  echo "  gh pr checks $PR_NUMBER"
+  echo ""
+  exit 1
+fi
