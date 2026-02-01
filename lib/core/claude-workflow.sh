@@ -388,6 +388,11 @@ if command -v claude-code &> /dev/null; then
   CLAUDE_CMD="claude-code"
 fi
 
+# Apply model override if configured
+if [ -n "${FORGE_CLAUDE_MODEL:-}" ]; then
+  CLAUDE_CMD="$CLAUDE_CMD --model $FORGE_CLAUDE_MODEL"
+fi
+
 CURRENT_BRANCH=$(git branch --show-current)
 
 # Check if already in a worktree

@@ -60,7 +60,7 @@ detect_auth_changes() {
     echo "Files: $(echo "$auth_files" | tr '\n' ', ')"
     echo ""
     echo "Auth changes require extra security review"
-    echo "Tip: Run in supervised mode (forge <issue>) to review and approve manually"
+    echo "Tip: Run in supervised mode (forge <issue> --supervised) to review and approve manually"
     return 1
   fi
 
@@ -79,7 +79,7 @@ detect_doc_changes() {
     echo "Docs: $(echo "$doc_files" | tr '\n' ', ')"
     echo ""
     echo "Architecture changes may require manual review"
-    echo "Tip: Run in supervised mode (forge <issue>) to review and approve manually"
+    echo "Tip: Run in supervised mode (forge <issue> --supervised) to review and approve manually"
     return 1
   fi
 

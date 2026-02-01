@@ -92,6 +92,9 @@ SESSION_STATE_FILE="${SESSION_STATE_FILE:-/tmp/forge-session-state-${FORGE_PROJE
 # Claude Code timeout (seconds, default 2 hours)
 FORGE_CLAUDE_TIMEOUT="${FORGE_CLAUDE_TIMEOUT:-7200}"
 
+# Claude Code model (empty = use Claude Code default, e.g. "opus", "sonnet", "haiku")
+FORGE_CLAUDE_MODEL="${FORGE_CLAUDE_MODEL:-}"
+
 # Dry-run mode
 FORGE_DRY_RUN="${FORGE_DRY_RUN:-false}"
 
@@ -154,6 +157,7 @@ export EMAIL_NOTIFICATION_ADDRESS
 export SCRATCHPAD_FILE
 export SESSION_STATE_FILE
 export FORGE_CLAUDE_TIMEOUT
+export FORGE_CLAUDE_MODEL
 export FORGE_DRY_RUN
 export SKIP_AWS_CHECK
 export BLOCKER_INFRASTRUCTURE_PATHS

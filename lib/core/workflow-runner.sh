@@ -111,7 +111,7 @@ handle_blocker() {
       echo "1. Review the changes shown above"
       echo "2. To bypass this blocker:"
       echo ""
-      echo "   # Supervised mode (bypasses all blockers with terminal warnings):"
+      echo "   # Supervised mode (bypasses blockers with terminal approval):"
       echo "   forge ${issue_number} --supervised"
       echo ""
       echo "   # Or unsupervised bypass (warnings sent to Slack):"

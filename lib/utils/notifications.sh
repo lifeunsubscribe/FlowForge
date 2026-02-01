@@ -179,7 +179,7 @@ send_blocker_notification() {
   case "$blocker_type" in
     auth_changes|architectural_docs|protected_scripts|infrastructure|database_migration|expensive_services)
       bypass_hint="
-_To bypass: \`${resume_cmd} --supervised\` (terminal warnings) or \`${resume_cmd} --bypass-blockers\` (Slack warnings)_"
+_To bypass: \`${resume_cmd} --supervised\` (terminal approval) or \`${resume_cmd} --bypass-blockers\` (Slack warnings)_"
       ;;
   esac
 
