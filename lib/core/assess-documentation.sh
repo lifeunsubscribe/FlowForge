@@ -179,6 +179,10 @@ REASON: <Brief explanation>
 - New AWS resources → docs/architecture/
 - New feature tiers or access control → docs/project/
 - Product roadmap changes → docs/project/
+- Input validation rule changes → docs/api/ or API-REFERENCE.md
+- Request/response schema changes → docs/api/ or API-REFERENCE.md
+- Zod/validation library updates → API documentation
+- Regex pattern changes for user input → API-REFERENCE.md
 
 **Examples of what doesn't need docs:**
 - Bug fixes to existing code (no pattern change)
