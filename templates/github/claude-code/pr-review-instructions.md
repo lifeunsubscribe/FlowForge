@@ -45,30 +45,99 @@ Analyze all changed files across these dimensions:
 ## Severity Classification
 
 ### 🔴 CRITICAL (Must Fix Before Merge)
-- Security vulnerabilities
-- Data integrity risks
-- Breaking changes without migration
-- Crashes or data loss scenarios
+
+Use ONLY for issues that would cause immediate harm if merged:
+
+✅ USE CRITICAL FOR:
+- Security vulnerabilities with concrete exploit path
+- SQL/Command/XSS injection
+- Authentication/authorization bypass
+- Secrets or credentials hardcoded in code
+- Data loss or corruption scenarios
+- Breaking changes without migration path
+
+❌ NOT CRITICAL:
+- Theoretical vulnerabilities without concrete path
+- Missing validation on internal endpoints
+- Performance issues (use HIGH)
+- Missing tests (use HIGH or MEDIUM)
 
 ### 🟠 HIGH (Should Fix Before Merge)
-- Missing error handling for likely scenarios
-- Missing input validation
-- Performance issues affecting users
+
+✅ USE HIGH FOR:
+- Missing input validation on user-facing endpoints
+- Unhandled errors that will crash in production
 - Logic bugs in core functionality
+- N+1 queries on frequently-accessed paths
+- Missing error handling for likely scenarios
+
+❌ NOT HIGH:
+- Style preferences (use LOW)
+- Missing documentation (use MEDIUM or LOW)
+- Test coverage gaps for non-critical code (use MEDIUM)
 
 ### 🟡 MEDIUM (Fix Soon)
-- Code quality issues
-- Missing logging/observability
+
+- Code quality issues affecting maintainability
+- Missing error handling for edge cases
 - Test coverage gaps
-- Minor performance concerns
+- Missing logging/observability
+- Suboptimal patterns that work correctly
 
 ### 🟢 LOW (Nice to Have)
+
 - Refactoring suggestions
 - Documentation improvements
-- Style preferences
+- Style consistency
 - Minor optimizations
 
 ## Output Format
+
+Your review MUST include TWO parts:
+1. A hidden JSON block for machine parsing (REQUIRED)
+2. Human-readable markdown (REQUIRED)
+
+### Part 1: JSON Data Block (Hidden)
+
+Start your review with this hidden block:
+
+```markdown
+<!-- sharkrite-review-data
+{
+  "metadata": {
+    "model": "[model name from context]",
+    "timestamp": "[ISO 8601 timestamp]",
+    "files_analyzed": [count]
+  },
+  "summary": {
+    "critical": [count],
+    "high": [count],
+    "medium": [count],
+    "low": [count],
+    "verdict": "BLOCK_MERGE|NEEDS_WORK|APPROVE_WITH_COMMENTS|APPROVED"
+  },
+  "items": [
+    {
+      "id": 1,
+      "severity": "CRITICAL|HIGH|MEDIUM|LOW",
+      "category": "Security|BugRisk|CodeQuality|Performance|Testing",
+      "title": "Brief issue title",
+      "file": "path/to/file.ts",
+      "line": 42,
+      "problem": "Description of the issue",
+      "impact": "Why this matters",
+      "recommendation": "How to fix it"
+    }
+  ],
+  "positive": [
+    "Good thing observed",
+    "Another good thing"
+  ]
+}
+-->
+```
+
+### Part 2: Human-Readable Review
 
 Structure your review as follows:
 
@@ -82,45 +151,53 @@ Structure your review as follows:
 
 ### 🔴 CRITICAL Issues
 
+<!-- item:1 severity:CRITICAL -->
 #### 1. [Brief Issue Title]
 **File:** `path/to/file.ts` (Line XX)
 **Category:** Security | Data Integrity | Breaking Change
 
-**Problem:**
+**Problem:** (REQUIRED)
 [Clear description of the problem]
 
-**Code:**
+**Code:** (REQUIRED for CRITICAL/HIGH)
 \`\`\`typescript
 [problematic code snippet]
 \`\`\`
 
-**Impact:**
+**Impact:** (REQUIRED for CRITICAL/HIGH)
 [Explanation of why this matters]
 
-**Fix:**
+**Fix:** (REQUIRED for CRITICAL/HIGH)
 \`\`\`typescript
 [suggested fix]
 \`\`\`
 
 - [ ] Action item for this issue
+<!-- /item:1 -->
 
 ---
 
 ### 🟠 HIGH Priority Issues
 
-[Same format as CRITICAL]
+<!-- item:N severity:HIGH -->
+[Same format as CRITICAL - all required fields]
+<!-- /item:N -->
 
 ---
 
 ### 🟡 MEDIUM Priority Issues
 
-[Same format]
+<!-- item:N severity:MEDIUM -->
+[Problem and File+Line required; Code/Impact/Fix optional]
+<!-- /item:N -->
 
 ---
 
 ### 🟢 LOW Priority Suggestions
 
-[Same format]
+<!-- item:N severity:LOW -->
+[Problem and File+Line required; Code/Impact/Fix optional]
+<!-- /item:N -->
 
 ---
 
@@ -139,6 +216,41 @@ Structure your review as follows:
 - [ ] [First action item]
 - [ ] [Second action item]
 ```
+
+## Verdict Rules
+
+Your verdict MUST match your findings. This is NOT optional.
+
+| If you found... | Verdict MUST be |
+|-----------------|-----------------|
+| Any CRITICAL items | `BLOCK_MERGE` |
+| HIGH items (no CRITICAL) | `NEEDS_WORK` |
+| Only MEDIUM/LOW items | `APPROVE_WITH_COMMENTS` |
+| No issues at all | `APPROVED` |
+
+**IMPORTANT:** You CANNOT say "APPROVED" or "APPROVE WITH COMMENTS" if you listed any CRITICAL or HIGH issues. The verdict in your JSON must match the verdict in your markdown summary.
+
+## Consistency Requirement
+
+Given the same code diff, you MUST produce the same review.
+
+Rules:
+- Apply severity criteria OBJECTIVELY - same code pattern = same severity everywhere
+- When genuinely uncertain between two severity levels, choose MORE SEVERE
+- Do not vary your assessment based on phrasing or mood
+- If you flag a pattern as CRITICAL in one file, flag it as CRITICAL in ALL files
+- The severity boundaries above are HARD RULES, not suggestions
+
+## Field Requirements
+
+| Field | CRITICAL | HIGH | MEDIUM | LOW |
+|-------|----------|------|--------|-----|
+| File + Line | Required | Required | Required | Required |
+| Problem | Required | Required | Required | Required |
+| Code snippet | Required | Required | Optional | Optional |
+| Impact | Required | Required | Optional | Optional |
+| Fix suggestion | Required | Required | Optional | Optional |
+| Action item | Required | Required | Optional | Optional |
 
 ## Guidelines
 

@@ -168,9 +168,21 @@ $(head -200 "$RITE_PROJECT_ROOT/CLAUDE.md")"
   print_info "Loaded project context from CLAUDE.md"
 fi
 
+# Get current timestamp for review metadata
+REVIEW_TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
 # Build the full prompt
 REVIEW_PROMPT="$REVIEW_INSTRUCTIONS
 $PROJECT_CONTEXT
+
+---
+
+## Review Metadata
+
+Use these values in your JSON output:
+- **Model:** $EFFECTIVE_MODEL
+- **Timestamp:** $REVIEW_TIMESTAMP
+- **Files Analyzed:** $DIFF_FILES
 
 ---
 
@@ -190,7 +202,7 @@ $PR_DIFF
 
 ---
 
-Please provide your code review following the output format specified above."
+Please provide your code review following the output format specified above. Remember to include both the hidden JSON data block AND the human-readable markdown review."
 
 # Estimate review time based on diff size
 if [ "$DIFF_LINES" -lt 100 ]; then

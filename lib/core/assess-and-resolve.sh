@@ -351,6 +351,45 @@ REVIEW_MODEL=$(extract_review_model "$REVIEW_BODY")
 print_info "Review model: $REVIEW_MODEL"
 export RITE_ASSESSMENT_MODEL="$REVIEW_MODEL"
 
+# =============================================================================
+# Extract structured JSON from review (new format with sharkrite-review-data)
+# Falls back to markdown parsing for older reviews
+# =============================================================================
+
+extract_review_json() {
+  local review_body="$1"
+  # Extract JSON from <!-- sharkrite-review-data ... --> block
+  local json_block=$(echo "$review_body" | sed -n '/<!-- sharkrite-review-data/,/-->/p' | sed '1d;$d')
+  if [ -n "$json_block" ] && echo "$json_block" | jq empty 2>/dev/null; then
+    echo "$json_block"
+  else
+    echo ""
+  fi
+}
+
+REVIEW_JSON_DATA=$(extract_review_json "$REVIEW_BODY")
+
+if [ -n "$REVIEW_JSON_DATA" ]; then
+  print_info "Found structured review data (JSON format)"
+  # Parse counts from JSON
+  JSON_CRITICAL=$(echo "$REVIEW_JSON_DATA" | jq -r '.summary.critical // 0' 2>/dev/null || echo "0")
+  JSON_HIGH=$(echo "$REVIEW_JSON_DATA" | jq -r '.summary.high // 0' 2>/dev/null || echo "0")
+  JSON_MEDIUM=$(echo "$REVIEW_JSON_DATA" | jq -r '.summary.medium // 0' 2>/dev/null || echo "0")
+  JSON_LOW=$(echo "$REVIEW_JSON_DATA" | jq -r '.summary.low // 0' 2>/dev/null || echo "0")
+  JSON_VERDICT=$(echo "$REVIEW_JSON_DATA" | jq -r '.summary.verdict // "UNKNOWN"' 2>/dev/null || echo "UNKNOWN")
+  JSON_ITEMS_COUNT=$(echo "$REVIEW_JSON_DATA" | jq -r '.items | length // 0' 2>/dev/null || echo "0")
+
+  print_info "JSON summary: CRITICAL=$JSON_CRITICAL HIGH=$JSON_HIGH MEDIUM=$JSON_MEDIUM LOW=$JSON_LOW"
+  print_info "JSON verdict: $JSON_VERDICT (${JSON_ITEMS_COUNT} items)"
+
+  # Export for use by downstream tools
+  export RITE_REVIEW_JSON="$REVIEW_JSON_DATA"
+  export RITE_REVIEW_FORMAT="json"
+else
+  print_info "No structured JSON found - will use markdown parsing"
+  export RITE_REVIEW_FORMAT="markdown"
+fi
+
 # Check if review is stale (commits pushed after review)
 # SKIP on retry > 0: We just generated fixes and a new review in the previous cycle.
 # Re-checking for stale would create an infinite loop of regenerating reviews.
