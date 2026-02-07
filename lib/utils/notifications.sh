@@ -163,11 +163,11 @@ send_blocker_notification() {
   local details="${5:-}"
 
   # Build resume command
-  local resume_cmd="forge ${issue_number}"
+  local resume_cmd="rite ${issue_number}"
   if [[ "$issue_number" == batch-* ]]; then
     # Extract actual issue number from batch-XX format
     local actual_issue="${issue_number#batch-}"
-    resume_cmd="forge ${actual_issue}"
+    resume_cmd="rite ${actual_issue}"
   fi
 
   # Get repo URL for clickable links

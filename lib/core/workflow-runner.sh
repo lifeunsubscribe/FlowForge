@@ -25,6 +25,13 @@ WORKFLOW_MODE="${WORKFLOW_MODE:-supervised}"
 RESUME_MODE=false
 BYPASS_BLOCKERS=false
 
+# Phase tracking for graceful exit and resume
+CURRENT_PHASE=""
+CURRENT_ISSUE=""
+CURRENT_PR=""
+CURRENT_RETRY=0
+INTERRUPT_RECEIVED=false
+
 # Script paths (all in core/)
 CLAUDE_WORKFLOW="$RITE_LIB_DIR/core/claude-workflow.sh"
 CREATE_PR="$RITE_LIB_DIR/core/create-pr.sh"
@@ -57,6 +64,125 @@ print_error() {
 
 print_warning() {
   echo "⚠️  WARNING: $1"
+}
+
+# ===================================================================
+# GRACEFUL EXIT HANDLING
+# ===================================================================
+
+# Handle Ctrl-C and SIGTERM gracefully
+cleanup_on_interrupt() {
+  local exit_code="${1:-130}"  # 130 is standard for SIGINT
+
+  # Prevent recursive traps
+  if [ "$INTERRUPT_RECEIVED" = true ]; then
+    echo ""
+    echo "Force exit requested. Exiting immediately."
+    exit 1
+  fi
+  INTERRUPT_RECEIVED=true
+
+  echo ""
+  echo ""
+  print_header "⚡ Interrupt Received - Saving State"
+
+  # Save session state if we have enough context
+  if [ -n "$CURRENT_ISSUE" ] && [ -n "${WORKTREE_PATH:-}" ] && [ -d "${WORKTREE_PATH:-}" ]; then
+    local phase_info="${CURRENT_PHASE:-unknown}"
+    local pr_info="${CURRENT_PR:-none}"
+
+    echo "📍 Current state:"
+    echo "   Issue:    #$CURRENT_ISSUE"
+    echo "   Phase:    $phase_info"
+    echo "   PR:       ${pr_info:-not created yet}"
+    echo "   Retry:    ${CURRENT_RETRY:-0}/3"
+    echo "   Worktree: $WORKTREE_PATH"
+    echo ""
+
+    # Check for uncommitted changes
+    cd "$WORKTREE_PATH" 2>/dev/null || true
+    local uncommitted=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+
+    if [ "$uncommitted" -gt 0 ]; then
+      echo "📝 Found $uncommitted uncommitted change(s)"
+
+      if [ "$WORKFLOW_MODE" = "unsupervised" ]; then
+        # Auto-commit in unsupervised mode
+        echo "   Auto-committing work in progress..."
+        git add -A 2>/dev/null || true
+        git commit -m "WIP: Auto-saved on interrupt (phase: $phase_info)" --no-verify 2>/dev/null || true
+        echo "   ✅ Changes committed"
+      else
+        echo "   ⚠️  Uncommitted changes will be preserved in worktree"
+        echo "   You can commit them manually before resuming"
+      fi
+    fi
+
+    # Save state with phase information using extended format
+    save_session_state_with_phase "$CURRENT_ISSUE" "interrupted" "$WORKTREE_PATH" "$phase_info" "$pr_info"
+
+    echo ""
+    print_success "Session state saved"
+    echo ""
+    echo "To resume, run:"
+    echo "   rite $CURRENT_ISSUE"
+    echo ""
+  else
+    echo "No active workflow state to save."
+    echo ""
+  fi
+
+  # Return to original directory
+  cd "$RITE_PROJECT_ROOT" 2>/dev/null || true
+
+  exit "$exit_code"
+}
+
+# Extended save function that includes phase checkpoint
+save_session_state_with_phase() {
+  local issue_number="$1"
+  local reason="$2"
+  local worktree_path="$3"
+  local phase="${4:-unknown}"
+  local pr_number="${5:-}"
+
+  local data_dir="${RITE_DATA_DIR:-.rite}"
+  local state_file="${RITE_PROJECT_ROOT:-.}/${data_dir}/session-state-${issue_number}.json"
+
+  # Ensure data directory exists
+  mkdir -p "${RITE_PROJECT_ROOT:-.}/${data_dir}"
+
+  # Get git status safely
+  local git_status_b64=""
+  local last_commit=""
+  if [ -d "$worktree_path" ]; then
+    git_status_b64=$(cd "$worktree_path" 2>/dev/null && git status --short | base64 || echo "")
+    last_commit=$(cd "$worktree_path" 2>/dev/null && git log -1 --oneline 2>/dev/null || echo "")
+  fi
+
+  cat > "$state_file" <<EOF
+{
+  "saved_at": $(date +%s),
+  "saved_at_human": "$(date '+%Y-%m-%d %H:%M:%S')",
+  "reason": "$reason",
+  "issue_number": "$issue_number",
+  "pr_number": "${pr_number:-null}",
+  "phase": "$phase",
+  "retry_count": ${CURRENT_RETRY:-0},
+  "worktree_path": "$worktree_path",
+  "workflow_mode": "$WORKFLOW_MODE",
+  "git_status": "$git_status_b64",
+  "last_commit": "$last_commit"
+}
+EOF
+
+  echo "💾 State saved: $state_file"
+}
+
+# Set up trap handlers (called after sourcing libraries)
+setup_interrupt_handlers() {
+  trap 'cleanup_on_interrupt 130' INT   # Ctrl-C
+  trap 'cleanup_on_interrupt 143' TERM  # kill
 }
 
 # ===================================================================
@@ -478,10 +604,30 @@ phase_assess_and_resolve() {
   local retry_count="${3:-0}"  # Default to 0 if not provided
   local max_retries=3
 
+  # Track retry count globally for interrupt handler
+  CURRENT_RETRY="$retry_count"
+
   print_header "Phase 3: Assess Review and Resolve Issues"
 
   if [ $retry_count -gt 0 ]; then
     print_info "Retry attempt $retry_count of $max_retries"
+  fi
+
+  # Check if a follow-up issue was created in a previous run and is now resolved
+  # This allows the workflow to skip directly to merge if resuming after manual resolution
+  local followup_marker=$(gh pr view "$pr_number" --json comments --jq '.comments[].body' 2>/dev/null | grep -oE 'sharkrite-followup-issue:[0-9]+' | tail -1 || echo "")
+  if [ -n "$followup_marker" ]; then
+    local followup_issue_num=$(echo "$followup_marker" | cut -d: -f2)
+    local followup_state=$(gh issue view "$followup_issue_num" --json state --jq '.state' 2>/dev/null || echo "")
+
+    if [ "$followup_state" = "CLOSED" ]; then
+      print_success "✅ Follow-up issue #$followup_issue_num has been resolved"
+      print_info "Skipping assessment loop - proceeding to merge"
+      return 0
+    elif [ -n "$followup_state" ]; then
+      print_info "📋 Follow-up issue #$followup_issue_num exists (state: $followup_state)"
+      print_info "Workflow will continue assessment to check if PR is ready to merge"
+    fi
   fi
 
   # Data flow: assess-and-resolve.sh outputs filtered review to stdout (no temp files)
@@ -504,7 +650,7 @@ phase_assess_and_resolve() {
   # - If actionable_count == 0: exit 0 (merge)
   # - If actionable_count > 0 AND retry < 3: exit 2 (loop to fix)
   # - If retry >= 3 AND CRITICAL+ACTIONABLE: create follow-up, exit 1 (block merge)
-  # - If retry >= 3 AND no CRITICAL: create security-debt, exit 0 (allow merge)
+  # - If retry >= 3 AND no CRITICAL: create tech-debt, exit 0 (allow merge)
   # In AUTO_MODE with CRITICAL issues, it will output filtered review content to stdout
   # and exit with code 2 (no temp files needed - we capture stdout directly)
 
@@ -513,24 +659,28 @@ phase_assess_and_resolve() {
   local assess_stdout=$(mktemp)
   local assess_stderr=$(mktemp)
 
-  echo "[WORKFLOW-RUNNER] About to call assess-and-resolve.sh..." >&2
-  echo "[WORKFLOW-RUNNER] PR: $pr_number, Issue: $issue_number, Retry: $retry_count" >&2
+  # Show assessment header with progress indicator
+  print_header "📊 PR Review Assessment"
+  print_info "Analyzing PR #$pr_number for issue #$issue_number..."
+  local assess_start_time=$(date +%s)
 
   set +e  # Temporarily disable exit-on-error to capture exit code properly
+  # Use process substitution to show stderr in real-time while capturing it
+  # This lets Claude assessment output stream to terminal as it runs
   if [ "$WORKFLOW_MODE" = "supervised" ]; then
-    "$ASSESS_RESOLVE" "$pr_number" "$issue_number" "$retry_count" > "$assess_stdout" 2>"$assess_stderr"
+    "$ASSESS_RESOLVE" "$pr_number" "$issue_number" "$retry_count" > "$assess_stdout" 2> >(tee "$assess_stderr" >&2)
   else
-    "$ASSESS_RESOLVE" "$pr_number" "$issue_number" "$retry_count" --auto > "$assess_stdout" 2>"$assess_stderr"
+    "$ASSESS_RESOLVE" "$pr_number" "$issue_number" "$retry_count" --auto > "$assess_stdout" 2> >(tee "$assess_stderr" >&2)
   fi
   local assessment_result=$?
+  # Wait for tee subprocesses to finish writing
+  wait
   set -e  # Re-enable exit-on-error
 
-  # Show assessment output (progress on success, errors on failure)
-  if [ -s "$assess_stderr" ]; then
-    cat "$assess_stderr" >&2
-  fi
-
-  echo "[WORKFLOW-RUNNER] Assessment returned exit code: $assessment_result" >&2
+  # Display elapsed time
+  local assess_end_time=$(date +%s)
+  local assess_elapsed=$((assess_end_time - assess_start_time))
+  print_info "Assessment completed in ${assess_elapsed}s"
 
   # Read stdout into variable (used for exit code 2 - fixes needed)
   review_content=$(cat "$assess_stdout")
@@ -570,20 +720,52 @@ phase_assess_and_resolve() {
       print_error "Maximum retry attempts ($max_retries) reached - manual intervention required"
       print_warning "Creating follow-up issue for manual resolution"
 
-      # Call assess-and-resolve in supervised mode to create follow-up issue
-      print_info "Creating follow-up issue with remaining CRITICAL items"
-      "$ASSESS_RESOLVE" "$pr_number" "$issue_number"
+      # Call assess-and-resolve to create follow-up issue
+      # IMPORTANT: Pass retry_count so it knows this is final (skips stale check, creates issue)
+      print_info "Creating follow-up issue with remaining items"
+      "$ASSESS_RESOLVE" "$pr_number" "$issue_number" "$retry_count"
 
       return 1
     fi
 
     # Call claude-workflow.sh in fix mode to address the review issues
-    # Pipe review content from assess-and-resolve directly to claude-workflow (no temp files!)
+    # Pass review via file argument (not stdin) to preserve TTY for Claude's interactive mode
     cd "$WORKTREE_PATH" || return 1
 
     if [ -n "$review_content" ]; then
-      print_info "Piping filtered review content to Claude workflow (no temp files)"
-      echo "$review_content" | "$CLAUDE_WORKFLOW" "$issue_number" --fix-review --auto
+      # Save review in worktree's .rite/ directory (cleaned up with worktree on merge)
+      local rite_dir="$WORKTREE_PATH/.rite"
+      mkdir -p "$rite_dir"
+      local review_file="$rite_dir/review-assessment-retry${retry_count}.md"
+      echo "$review_content" > "$review_file"
+
+      print_info "Saved review assessment to: .rite/review-assessment-retry${retry_count}.md"
+
+      # Respect supervised/unsupervised mode
+      if [ "$WORKFLOW_MODE" = "supervised" ]; then
+        "$CLAUDE_WORKFLOW" "$issue_number" --fix-review --review-file "$review_file"
+      else
+        "$CLAUDE_WORKFLOW" "$issue_number" --fix-review --review-file "$review_file" --auto
+      fi
+      local fix_result=$?
+
+      # Don't delete review_file - keeps history until worktree cleanup on merge
+
+      if [ $fix_result -ne 0 ]; then
+        print_error "Claude workflow fix mode failed (exit code: $fix_result)"
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "Troubleshooting:"
+        echo "  1. Check the review file: $review_file"
+        echo "  2. The Claude session may have timed out or errored"
+        echo "  3. Run manually to debug:"
+        echo "     cd $WORKTREE_PATH"
+        echo "     cat $review_file"
+        echo "     $CLAUDE_WORKFLOW $issue_number --fix-review --review-file $review_file"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+        return 1
+      fi
     else
       print_error "No review content captured from assess-and-resolve"
       return 1
@@ -851,37 +1033,121 @@ EOF
     return 0
   fi
 
-  # Phase 0: Pre-start checks
-  if ! phase_pre_start_checks "$issue_number"; then
-    return 1
+  # Determine starting phase based on resume state
+  # Phase order: pre-start -> claude-workflow -> create-pr -> assess-resolve -> merge -> completion
+  local skip_to_phase=""
+  if [ "$RESUME_MODE" = true ] && [ -n "${RESUME_PHASE:-}" ]; then
+    case "$RESUME_PHASE" in
+      pre-start|phase-0)
+        skip_to_phase=""  # Start from beginning
+        ;;
+      claude-workflow|phase-1)
+        skip_to_phase="claude-workflow"
+        print_info "Resuming from phase 1 (Claude workflow)"
+        ;;
+      create-pr|phase-2)
+        skip_to_phase="create-pr"
+        print_info "Resuming from phase 2 (Create PR)"
+        ;;
+      assess-resolve|phase-3)
+        skip_to_phase="assess-resolve"
+        print_info "Resuming from phase 3 (Assess & Resolve)"
+        ;;
+      merge|phase-4)
+        skip_to_phase="merge"
+        print_info "Resuming from phase 4 (Merge)"
+        ;;
+      *)
+        print_warning "Unknown resume phase: $RESUME_PHASE - starting from beginning"
+        ;;
+    esac
+
+    # If resuming to phase 3+ and we don't have PR_NUMBER, detect it from the branch
+    if [ "$skip_to_phase" = "assess-resolve" ] || [ "$skip_to_phase" = "merge" ]; then
+      if [ -z "${PR_NUMBER:-}" ]; then
+        cd "$WORKTREE_PATH" 2>/dev/null || true
+        local branch_name=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+        if [ -n "$branch_name" ]; then
+          PR_NUMBER=$(gh pr view "$branch_name" --json number --jq '.number' 2>/dev/null || echo "")
+          if [ -n "$PR_NUMBER" ]; then
+            CURRENT_PR="$PR_NUMBER"
+            export PR_NUMBER
+            print_info "Detected existing PR: #$PR_NUMBER"
+          else
+            print_error "Cannot resume to phase 3+ without a PR"
+            print_info "Branch '$branch_name' has no associated PR"
+            return 1
+          fi
+        fi
+      fi
+    fi
+  fi
+
+  # Phase 0: Pre-start checks (always run unless skipping past it)
+  if [ -z "$skip_to_phase" ]; then
+    CURRENT_PHASE="pre-start"
+    if ! phase_pre_start_checks "$issue_number"; then
+      return 1
+    fi
   fi
 
   # Phase 1: Claude workflow (development)
-  if ! phase_claude_workflow "$issue_number"; then
-    print_error "Workflow phase failed"
-    return 1
+  if [ -z "$skip_to_phase" ] || [ "$skip_to_phase" = "claude-workflow" ]; then
+    CURRENT_PHASE="claude-workflow"
+    skip_to_phase=""  # Clear skip flag after reaching target
+    if ! phase_claude_workflow "$issue_number"; then
+      print_error "Workflow phase failed"
+      return 1
+    fi
   fi
 
   # Phase 2: Push work and wait for review
-  if ! phase_create_pr "$issue_number"; then
-    print_error "PR phase failed"
-    return 1
+  if [ -z "$skip_to_phase" ] || [ "$skip_to_phase" = "create-pr" ]; then
+    CURRENT_PHASE="create-pr"
+    skip_to_phase=""
+    if ! phase_create_pr "$issue_number"; then
+      print_error "PR phase failed"
+      return 1
+    fi
   fi
 
   # Phase 3: Assess review and resolve issues (auto-fix loop)
-  if ! phase_assess_and_resolve "$issue_number" "$PR_NUMBER"; then
-    print_error "Assessment phase failed"
-    return 1
+  if [ -z "$skip_to_phase" ] || [ "$skip_to_phase" = "assess-resolve" ]; then
+    CURRENT_PHASE="assess-resolve"
+    CURRENT_PR="$PR_NUMBER"
+    skip_to_phase=""
+    # Pass RESUME_RETRY if resuming mid-loop (ensures follow-up creation happens)
+    local start_retry="${RESUME_RETRY:-0}"
+    if ! phase_assess_and_resolve "$issue_number" "$PR_NUMBER" "$start_retry"; then
+      print_error "Assessment phase failed"
+      echo ""
+      echo "The workflow stopped during Phase 3 (Assess & Resolve)."
+      echo "Check the output above for specific error details."
+      echo ""
+      return 1
+    fi
   fi
 
   # Phase 4: Merge PR and update docs
-  if ! phase_merge_pr "$issue_number" "$PR_NUMBER"; then
-    print_error "Merge phase failed"
-    return 1
+  if [ -z "$skip_to_phase" ] || [ "$skip_to_phase" = "merge" ]; then
+    CURRENT_PHASE="merge"
+    skip_to_phase=""
+    if ! phase_merge_pr "$issue_number" "$PR_NUMBER"; then
+      print_error "Merge phase failed"
+      return 1
+    fi
   fi
 
   # Phase 5: Completion and notifications
+  CURRENT_PHASE="completion"
   phase_completion "$issue_number" "$PR_NUMBER"
+
+  # Clear state file on successful completion
+  local state_file="${RITE_PROJECT_ROOT}/${RITE_DATA_DIR}/session-state-${issue_number}.json"
+  if [ -f "$state_file" ]; then
+    rm -f "$state_file"
+    print_info "Cleared session state (workflow complete)"
+  fi
 
   return 0
 }
@@ -941,24 +1207,57 @@ main() {
     shift
   done
 
-  # Check for saved session state from a previous blocker
+  # Set up interrupt handlers for graceful Ctrl-C exit
+  setup_interrupt_handlers
+
+  # Track current issue globally for interrupt handler
+  CURRENT_ISSUE="$issue_number"
+
+  # Check for saved session state from a previous interrupt or blocker
   local state_file="${RITE_PROJECT_ROOT}/${RITE_DATA_DIR}/session-state-${issue_number}.json"
+  local RESUME_PHASE=""
+  local RESUME_RETRY=0
   if [ -f "$state_file" ]; then
     local saved_reason=$(jq -r '.reason // "unknown"' "$state_file" 2>/dev/null)
     local saved_worktree=$(jq -r '.worktree_path // ""' "$state_file" 2>/dev/null)
+    local saved_phase=$(jq -r '.phase // ""' "$state_file" 2>/dev/null)
+    local saved_pr=$(jq -r '.pr_number // ""' "$state_file" 2>/dev/null)
+    local saved_retry=$(jq -r '.retry_count // 0' "$state_file" 2>/dev/null)
 
-    print_info "Found saved session state (blocker: $saved_reason)"
+    print_info "Found saved session state (reason: $saved_reason, phase: ${saved_phase:-unknown})"
 
     # Use saved worktree path if it still exists
     if [ -n "$saved_worktree" ] && [ "$saved_worktree" != "null" ] && [ -d "$saved_worktree" ]; then
       WORKTREE_PATH="$saved_worktree"
       export WORKTREE_PATH
       RESUME_MODE=true
-      print_success "Resuming from worktree: $WORKTREE_PATH"
+      RESUME_PHASE="$saved_phase"
+
+      # Restore retry count if resuming to assess-resolve phase
+      if [ "$saved_phase" = "assess-resolve" ] && [ -n "$saved_retry" ] && [ "$saved_retry" != "null" ]; then
+        RESUME_RETRY="$saved_retry"
+        CURRENT_RETRY="$saved_retry"
+      fi
+
+      # Restore PR number if available
+      if [ -n "$saved_pr" ] && [ "$saved_pr" != "null" ]; then
+        CURRENT_PR="$saved_pr"
+        PR_NUMBER="$saved_pr"
+        export PR_NUMBER
+      fi
+
+      print_success "Resuming from phase: ${saved_phase:-unknown}"
+      print_info "Worktree: $WORKTREE_PATH"
+      [ -n "$CURRENT_PR" ] && print_info "PR: #$CURRENT_PR"
+      [ "$RESUME_RETRY" -gt 0 ] && print_info "Retry: $RESUME_RETRY/3"
     else
       print_warning "Saved worktree no longer exists - starting fresh"
     fi
   fi
+
+  # Export resume phase and retry for run_workflow
+  export RESUME_PHASE
+  export RESUME_RETRY
 
   # Initialize session (always create fresh session with current start_time)
   # Even when resuming, we start a fresh Claude process with a new context window,

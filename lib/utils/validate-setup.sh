@@ -123,7 +123,7 @@ done
 echo ""
 
 # Check 6: Forge installation
-print_info "Checking forge installation..."
+print_info "Checking rite installation..."
 
 REQUIRED_RITE_DIRS=(
   "$RITE_LIB_DIR/utils"
@@ -381,7 +381,7 @@ if [ -f "$WORKFLOW_FILE" ]; then
   else
     print_warning "Review instructions file missing"
     print_info "Create: .github/claude-code/pr-review-instructions.md"
-    print_info "Or run: forge --init (will offer to create it)"
+    print_info "Or run: rite --init (will offer to create it)"
   fi
 
   # Check if workflow references the instructions
@@ -394,7 +394,56 @@ if [ -f "$WORKFLOW_FILE" ]; then
 
 else
   print_warning "No Claude Code review workflow found"
-  print_info "Run 'forge --init' to create one"
+  print_info "Run 'rite --init' to create one"
+fi
+echo ""
+
+# Check 14: Gitignore patterns for workflow artifacts
+print_info "Checking .gitignore for workflow artifacts..."
+
+GITIGNORE_FILE="$RITE_PROJECT_ROOT/.gitignore"
+REQUIRED_IGNORES=(
+  ".rite/"
+  ".claude/"
+  ".forge/"
+)
+
+if [ -f "$GITIGNORE_FILE" ]; then
+  MISSING_IGNORES=()
+  for pattern in "${REQUIRED_IGNORES[@]}"; do
+    if ! grep -qF "$pattern" "$GITIGNORE_FILE"; then
+      MISSING_IGNORES+=("$pattern")
+    fi
+  done
+
+  if [ ${#MISSING_IGNORES[@]} -eq 0 ]; then
+    print_success "All workflow artifact patterns in .gitignore"
+  else
+    print_warning "Missing gitignore patterns: ${MISSING_IGNORES[*]}"
+
+    if [ "$FIX_MODE" = true ]; then
+      echo "" >> "$GITIGNORE_FILE"
+      echo "# Sharkrite workflow artifacts (auto-added by rite validate --fix)" >> "$GITIGNORE_FILE"
+      for pattern in "${MISSING_IGNORES[@]}"; do
+        echo "$pattern" >> "$GITIGNORE_FILE"
+      done
+      print_success "Added missing patterns to .gitignore"
+    else
+      print_info "Run 'rite validate --fix' to add them"
+    fi
+  fi
+else
+  print_warning ".gitignore does not exist"
+
+  if [ "$FIX_MODE" = true ]; then
+    echo "# Sharkrite workflow artifacts" > "$GITIGNORE_FILE"
+    for pattern in "${REQUIRED_IGNORES[@]}"; do
+      echo "$pattern" >> "$GITIGNORE_FILE"
+    done
+    print_success "Created .gitignore with workflow artifact patterns"
+  else
+    print_info "Run 'rite validate --fix' to create one"
+  fi
 fi
 echo ""
 
@@ -405,8 +454,8 @@ if [ $ISSUES_FOUND -eq 0 ]; then
   print_success "All checks passed! Forge workflow automation is ready to use."
   echo ""
   echo "Next steps:"
-  echo "  1. Start workflow: forge ISSUE_NUMBER"
-  echo "  2. Or batch process: forge 19 21"
+  echo "  1. Start workflow: rite ISSUE_NUMBER"
+  echo "  2. Or batch process: rite 19 21"
   echo ""
   exit 0
 else
@@ -415,7 +464,7 @@ else
 
   if [ "$FIX_MODE" = false ]; then
     echo "To auto-fix issues where possible:"
-    echo "  forge validate --fix"
+    echo "  rite validate --fix"
     echo ""
   fi
 

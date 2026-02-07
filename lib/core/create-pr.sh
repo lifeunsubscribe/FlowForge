@@ -17,6 +17,9 @@ fi
 # Source blocker rules for early detection
 source "$RITE_LIB_DIR/utils/blocker-rules.sh"
 
+# Source review helper for consistent review method handling
+source "$RITE_LIB_DIR/utils/review-helper.sh"
+
 # Parse arguments
 AUTO_MODE=false
 ISSUE_NUMBER=""
@@ -95,7 +98,7 @@ if [[ "$CURRENT_BRANCH" == "main" || "$CURRENT_BRANCH" == "develop" ]]; then
       exit 0
     else
       print_error "No worktree found for issue #$ISSUE_NUMBER"
-      print_info "First run: forge $ISSUE_NUMBER --quick"
+      print_info "First run: rite $ISSUE_NUMBER --quick"
       exit 1
     fi
   else
@@ -310,35 +313,67 @@ fi
 print_info "Running pre-review blocker checks..."
 
 # Check for various file-based blockers
+# Temporarily disable exit-on-error so blocker check failures don't crash the script
 blocker_detected=false
 blocker_type=""
 blocker_details=""
 
-if ! detect_infrastructure_changes "$PR_NUMBER" 2>&1 >/dev/null; then
+set +e  # Disable exit-on-error for blocker detection
+(
+  # Run in subshell to isolate any failures
+  detect_infrastructure_changes "$PR_NUMBER" >/dev/null 2>&1
+)
+if [ $? -ne 0 ]; then
   blocker_type="infrastructure"
-  blocker_details=$(detect_infrastructure_changes "$PR_NUMBER" 2>&1)
-  blocker_detected=true
-elif ! detect_database_migrations "$PR_NUMBER" 2>&1 >/dev/null; then
-  blocker_type="database_migration"
-  blocker_details=$(detect_database_migrations "$PR_NUMBER" 2>&1)
-  blocker_detected=true
-elif ! detect_auth_changes "$PR_NUMBER" 2>&1 >/dev/null; then
-  blocker_type="auth_changes"
-  blocker_details=$(detect_auth_changes "$PR_NUMBER" 2>&1)
-  blocker_detected=true
-elif ! detect_doc_changes "$PR_NUMBER" 2>&1 >/dev/null; then
-  blocker_type="architectural_docs"
-  blocker_details=$(detect_doc_changes "$PR_NUMBER" 2>&1)
-  blocker_detected=true
-elif ! detect_expensive_services "$PR_NUMBER" 2>&1 >/dev/null; then
-  blocker_type="expensive_services"
-  blocker_details=$(detect_expensive_services "$PR_NUMBER" 2>&1)
-  blocker_detected=true
-elif ! detect_protected_scripts "$PR_NUMBER" 2>&1 >/dev/null; then
-  blocker_type="protected_scripts"
-  blocker_details=$(detect_protected_scripts "$PR_NUMBER" 2>&1)
+  blocker_details=$(detect_infrastructure_changes "$PR_NUMBER" 2>&1 || echo "Infrastructure changes detected")
   blocker_detected=true
 fi
+
+if [ "$blocker_detected" = false ]; then
+  ( detect_database_migrations "$PR_NUMBER" >/dev/null 2>&1 )
+  if [ $? -ne 0 ]; then
+    blocker_type="database_migration"
+    blocker_details=$(detect_database_migrations "$PR_NUMBER" 2>&1 || echo "Database migration detected")
+    blocker_detected=true
+  fi
+fi
+
+if [ "$blocker_detected" = false ]; then
+  ( detect_auth_changes "$PR_NUMBER" >/dev/null 2>&1 )
+  if [ $? -ne 0 ]; then
+    blocker_type="auth_changes"
+    blocker_details=$(detect_auth_changes "$PR_NUMBER" 2>&1 || echo "Auth changes detected")
+    blocker_detected=true
+  fi
+fi
+
+if [ "$blocker_detected" = false ]; then
+  ( detect_doc_changes "$PR_NUMBER" >/dev/null 2>&1 )
+  if [ $? -ne 0 ]; then
+    blocker_type="architectural_docs"
+    blocker_details=$(detect_doc_changes "$PR_NUMBER" 2>&1 || echo "Architectural doc changes detected")
+    blocker_detected=true
+  fi
+fi
+
+if [ "$blocker_detected" = false ]; then
+  ( detect_expensive_services "$PR_NUMBER" >/dev/null 2>&1 )
+  if [ $? -ne 0 ]; then
+    blocker_type="expensive_services"
+    blocker_details=$(detect_expensive_services "$PR_NUMBER" 2>&1 || echo "Expensive services detected")
+    blocker_detected=true
+  fi
+fi
+
+if [ "$blocker_detected" = false ]; then
+  ( detect_protected_scripts "$PR_NUMBER" >/dev/null 2>&1 )
+  if [ $? -ne 0 ]; then
+    blocker_type="protected_scripts"
+    blocker_details=$(detect_protected_scripts "$PR_NUMBER" 2>&1 || echo "Protected script changes detected")
+    blocker_detected=true
+  fi
+fi
+set -e  # Re-enable exit-on-error
 
 if [ "$blocker_detected" = true ]; then
   print_warning "Blocker detected: $blocker_type"
@@ -346,41 +381,86 @@ if [ "$blocker_detected" = true ]; then
   echo "$blocker_details"
   echo ""
   print_info "This PR requires manual review before proceeding"
-  print_info "Run in supervised mode to review and approve: forge <issue> --supervised"
+  print_info "Run in supervised mode to review and approve: rite <issue> --supervised"
   echo ""
 
-  # Export blocker details for workflow-runner to handle
-  export BLOCKER_TYPE="$blocker_type"
-  export BLOCKER_DETAILS="$blocker_details"
+  # Write blocker details to file for workflow-runner to read
+  # (exports don't persist across process boundaries)
+  mkdir -p "${RITE_PROJECT_ROOT:-.}/.rite"
+  cat > "${RITE_PROJECT_ROOT:-.}/.rite/early-blocker.env" <<EOF
+BLOCKER_TYPE="$blocker_type"
+BLOCKER_DETAILS="$blocker_details"
+PR_NUMBER="$PR_NUMBER"
+EOF
   exit 10  # Exit code 10 signals blocker detected
 fi
 
 print_success "No file-based blockers detected"
 echo ""
 
-# Check if an automated reviewer is likely installed on this repo
-# Look for recent comments from known review bots on any PR
-REVIEW_BOT_DETECTED=false
-RECENT_BOT_COMMENT=$(gh api "repos/{owner}/{repo}/issues/comments?per_page=30&sort=created&direction=desc" \
-  --jq '[.[] | select(.user.login == "claude[bot]" or .user.login == "claude" or .user.login == "github-actions[bot]" and (.body | test("review|CRITICAL|WARNING|MINOR"; "i")))] | length' \
-  2>/dev/null || echo "0")
+# Determine review method based on config (app, local, or auto)
+# This respects RITE_REVIEW_METHOD from config.sh
+print_header "🔍 Review Method Selection"
 
-if [ "${RECENT_BOT_COMMENT:-0}" -gt 0 ]; then
-  REVIEW_BOT_DETECTED=true
+REVIEW_METHOD="${RITE_REVIEW_METHOD:-auto}"
+
+if ! should_wait_for_app_review; then
+  # Config says use local, or auto mode with no app detected
+  if [ "$REVIEW_METHOD" = "local" ]; then
+    print_info "Review method: Local Claude Code"
+    print_info "   Reason: RITE_REVIEW_METHOD=local (config preference)"
+    print_info "Triggering local review immediately..."
+    echo ""
+
+    if [ "$AUTO_MODE" = true ]; then
+      trigger_local_review "$PR_NUMBER" --auto || {
+        print_error "Local review failed"
+        exit 1
+      }
+    else
+      trigger_local_review "$PR_NUMBER" || {
+        print_error "Local review failed"
+        exit 1
+      }
+    fi
+
+    print_success "Local review posted to PR #$PR_NUMBER"
+    echo ""
+    exit 0
+  else
+    # Auto mode, no app detected - this is fallback
+    print_warning "Review method: Local Claude Code (fallback)"
+    print_info "   Reason: RITE_REVIEW_METHOD=auto (fallback: no GitHub app detected)"
+    print_info "Triggering local review..."
+    echo ""
+
+    if [ "$AUTO_MODE" = true ]; then
+      trigger_local_review "$PR_NUMBER" --auto || {
+        print_error "Local review failed"
+        exit 1
+      }
+    else
+      trigger_local_review "$PR_NUMBER" || {
+        print_error "Local review failed"
+        exit 1
+      }
+    fi
+
+    print_success "Local review posted to PR #$PR_NUMBER"
+    echo ""
+    exit 0
+  fi
 fi
 
-if [ "$REVIEW_BOT_DETECTED" = false ]; then
-  print_warning "No automated review bot detected on this repo"
-  echo ""
-  echo "  Forge looks for review comments from: claude[bot], github-actions[bot]"
-  echo "  To enable automated reviews, install the Claude for GitHub app:"
-  echo "  https://github.com/apps/claude"
-  echo ""
-  print_info "Skipping review wait — PR is ready for manual review"
-  echo "  PR: ${PR_URL:-#$PR_NUMBER}"
-  echo ""
-  exit 0
+# If we get here, we're waiting for the GitHub app review
+if [ "$REVIEW_METHOD" = "app" ]; then
+  print_info "Review method: GitHub App"
+  print_info "   Reason: RITE_REVIEW_METHOD=app (config preference)"
+else
+  print_info "Review method: GitHub App"
+  print_info "   Reason: RITE_REVIEW_METHOD=auto (default: app detected)"
 fi
+echo ""
 
 # Set up SIGINT trap for clean Ctrl-C exit during review wait
 trap 'echo ""; print_warning "Review wait interrupted by user (Ctrl-C)"; exit 130' SIGINT
@@ -418,8 +498,9 @@ PR_READY=false
 LATEST_COMMIT_TIME=$(gh pr view $PR_NUMBER --json commits \
   --jq '.commits[-1].committedDate' 2>/dev/null)
 
+# Check for reviews from Claude bots OR local reviews (marked with sharkrite-local-review)
 EXISTING_REVIEW_DATA=$(gh pr view $PR_NUMBER --json comments \
-  --jq '[.comments[] | select(.author.login == "claude" or .author.login == "claude[bot]" or .author.login == "github-actions[bot]")] | .[-1] | {body: .body, createdAt: .createdAt}' \
+  --jq '[.comments[] | select(.author.login == "claude" or .author.login == "claude[bot]" or .author.login == "github-actions[bot]" or (.body | contains("<!-- sharkrite-local-review -->")))] | .[-1] | {body: .body, createdAt: .createdAt}' \
   2>/dev/null)
 
 EXISTING_REVIEW_TIME=$(echo "$EXISTING_REVIEW_DATA" | jq -r '.createdAt' 2>/dev/null)
@@ -475,9 +556,9 @@ while [ "$PR_READY" != true ] && [ $ELAPSED -lt $MAX_TOTAL_WAIT ]; do
   LATEST_COMMIT_TIME=$(gh pr view $PR_NUMBER --json commits \
     --jq '.commits[-1].committedDate' 2>/dev/null)
 
-  # Check for Claude Code review comments with timestamp
+  # Check for Claude Code review comments with timestamp (bot accounts OR local reviews)
   REVIEW_DATA=$(gh pr view $PR_NUMBER --json comments \
-    --jq '[.comments[] | select(.author.login == "claude" or .author.login == "claude-code" or .author.login == "github-actions[bot]")] | .[-1] | {body: .body, createdAt: .createdAt, author: .author.login}' \
+    --jq '[.comments[] | select(.author.login == "claude" or .author.login == "claude-code" or .author.login == "github-actions[bot]" or (.body | contains("<!-- sharkrite-local-review -->")))] | .[-1] | {body: .body, createdAt: .createdAt, author: .author.login}' \
     2>/dev/null)
 
   LATEST_REVIEW=$(echo "$REVIEW_DATA" | jq -r '.body' 2>/dev/null)

@@ -8,7 +8,10 @@
 # =============================================================================
 
 # Paths that trigger the infrastructure blocker
-# BLOCKER_INFRASTRUCTURE_PATHS="infrastructure/|cdk/|terraform/|cloudformation/"
+# Default: infrastructure/|cdk/|terraform/|cloudformation/|\.github/workflows/|\.claude/
+# Note: .github/workflows/ and .claude/ are protected to prevent fix loops from
+# modifying workflow configuration or Claude settings (control inversion prevention)
+# BLOCKER_INFRASTRUCTURE_PATHS="infrastructure/|cdk/|terraform/|cloudformation/|\.github/workflows/|\.claude/"
 
 # =============================================================================
 # Database Migrations (block auto-merge)

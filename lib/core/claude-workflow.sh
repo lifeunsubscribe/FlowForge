@@ -6,7 +6,7 @@
 #   forge 19                            # From GitHub issue (supervised)
 #   forge 19 --quick                    # From GitHub issue (unsupervised)
 #   forge "add oauth"                   # From description (supervised)
-#   forge --continue                    # Continue work on existing branch
+#   rite --continue                    # Continue work on existing branch
 #
 # Features:
 #   - Smart worktree detection (auto-navigates to existing worktrees)
@@ -91,7 +91,7 @@ cleanup_on_interrupt() {
     # Save session state for resume if we have enough context
     if [ -n "${ISSUE_NUMBER:-}" ] && [ -n "$current_dir" ]; then
       save_session_state "${ISSUE_NUMBER}" "interrupted" "$current_dir" 2>/dev/null || true
-      echo -e "\033[0;34mℹ️  Session state saved — run 'forge ${ISSUE_NUMBER}' to resume\033[0m"
+      echo -e "\033[0;34mℹ️  Session state saved — run 'rite ${ISSUE_NUMBER}' to resume\033[0m"
     fi
 
     # Navigate back to main repo if in worktree
@@ -113,12 +113,14 @@ AUTO_MODE=false
 FIX_REVIEW_MODE=false
 ISSUE_NUMBER=""
 ISSUE_DESC=""
+REVIEW_FILE=""
 
 # First pass: detect flags
 for arg in "$@"; do
   case $arg in
     --auto) AUTO_MODE=true ;;
     --fix-review) FIX_REVIEW_MODE=true ;;
+    --review-file=*) REVIEW_FILE="${arg#*=}" ;;
   esac
 done
 
@@ -126,6 +128,15 @@ done
 while [[ $# -gt 0 ]]; do
   case $1 in
     --auto|--fix-review)
+      # Already processed in first pass
+      shift
+      ;;
+    --review-file)
+      # Next arg is the file path
+      REVIEW_FILE="$2"
+      shift 2
+      ;;
+    --review-file=*)
       # Already processed in first pass
       shift
       ;;
@@ -201,12 +212,17 @@ if [ "$FIX_REVIEW_MODE" = true ]; then
   # Now run the fix-review logic inline
   print_header "🔧 Review Fix Mode"
 
-  # Read review content from stdin
-  print_info "Reading review content from stdin..."
-  REVIEW_CONTENT=$(cat)
+  # Read review content from file (preferred) or stdin (fallback)
+  if [ -n "$REVIEW_FILE" ] && [ -f "$REVIEW_FILE" ]; then
+    print_info "Reading review content from file: $REVIEW_FILE"
+    REVIEW_CONTENT=$(cat "$REVIEW_FILE")
+  else
+    print_info "Reading review content from stdin..."
+    REVIEW_CONTENT=$(cat)
+  fi
 
   if [ -z "$REVIEW_CONTENT" ]; then
-    print_error "No review content received via stdin"
+    print_error "No review content received"
     exit 1
   fi
 
@@ -219,10 +235,11 @@ if [ "$FIX_REVIEW_MODE" = true ]; then
   MEDIUM_ISSUES=$(echo "$REVIEW_CONTENT" | sed -n '/^## .*[Mm]edium/,/^##[^#]/p' | grep -E '^### [0-9]+\.' || echo "")
   LOW_ISSUES=$(echo "$REVIEW_CONTENT" | sed -n '/^## .*[Ll]ow/,/^##[^#]/p' | grep -E '^### [0-9]+\.' || echo "")
 
-  # Build fix prompt
+  # Build fix prompt - tool restrictions are enforced by --disallowedTools flag
   FIX_PROMPT="## Review Issues to Fix
 
-The automated PR review found issues that need to be addressed. Please fix ALL of the following ACTIONABLE items:
+The automated PR review found issues that need to be addressed.
+All context is provided below - fix the ACTIONABLE items in the code.
 
 "
 
@@ -258,30 +275,91 @@ $(echo "$REVIEW_CONTENT" | sed -n '/^## .*[Ll]ow/,/^##[^#]/p')
 "
   fi
 
+  # Both modes now auto-complete (stdin piping, no interactive session)
+  EXIT_INSTRUCTION="Session will end automatically when you finish making all fixes."
+
   FIX_PROMPT+="## Instructions
 
-1. **Read the review issues above carefully**
+1. **Read the issues listed above** - all context is provided
 2. **Fix each issue** - make the necessary code changes
 3. **Verify your fixes** - ensure the changes address the concerns
-4. **Exit immediately** after fixing by typing \`/quit\` or \`/exit\`
 
-The workflow will automatically commit, push, and wait for a new review.
+The workflow will automatically commit, push, and request a new review.
 
-**IMPORTANT**: Focus only on the issues listed above. Do not make unrelated changes."
+## Scope
+- Read and edit source code files to fix the listed issues
+- Run tests if mentioned in the issue
+- Do NOT modify workflow, config, or CI files (.rite/, .github/workflows/, .claude/)
+
+$EXIT_INSTRUCTION"
 
   print_info "Invoking Claude Code to fix review issues..."
   echo ""
 
   # Run Claude Code with the fix prompt
-  # Use printf instead of echo for safety with untrusted content
-  # This prevents any potential shell interpretation of special characters
+  # Pass prompt as argument (not stdin) to preserve TTY for interactive mode
+  # Add timeout for fix-review mode (default 30 minutes)
+  FIX_TIMEOUT=${RITE_FIX_TIMEOUT:-1800}
+
+  # CODE-BASED TOOL RESTRICTIONS (not prompt-based)
+  # Block gh, curl, and other network commands to prevent Claude from fetching external data
+  # This is enforced by the CLI, not by instructions that Claude can ignore
+  DISALLOWED_TOOLS='Bash(gh *),Bash(gh),Bash(curl *),Bash(wget *),Bash(*gh pr*),Bash(*gh issue*),Bash(*gh api*)'
+
+  # Write prompt to temp file (more reliable than passing as argument)
+  FIX_PROMPT_FILE=$(mktemp)
+  echo "$FIX_PROMPT" > "$FIX_PROMPT_FILE"
+
   if [ "$AUTO_MODE" = true ]; then
-    printf '%s\n' "$FIX_PROMPT" | $CLAUDE_CMD --permission-mode bypassPermissions
+    print_info "Auto mode: Claude will exit automatically when fixes complete (timeout: ${FIX_TIMEOUT}s)"
+    set +e  # Temporarily disable exit-on-error to capture timeout
+    timeout "$FIX_TIMEOUT" $CLAUDE_CMD --print --dangerously-skip-permissions --disallowedTools "$DISALLOWED_TOOLS" < "$FIX_PROMPT_FILE"
+    FIX_EXIT_CODE=$?
+    set -e
+
+    rm -f "$FIX_PROMPT_FILE"
+
+    if [ $FIX_EXIT_CODE -eq 124 ]; then
+      print_warning "Fix timeout reached (${FIX_TIMEOUT}s) - checking for changes..."
+      # Even on timeout, we might have partial fixes
+      if [ "$(git status --porcelain | grep -vE '^\?\?' | wc -l | tr -d ' ')" -gt 0 ]; then
+        print_info "Found uncommitted changes - will commit what we have"
+      else
+        print_error "No fixes made before timeout"
+        exit 1
+      fi
+    elif [ $FIX_EXIT_CODE -ne 0 ]; then
+      print_warning "Claude exited with code $FIX_EXIT_CODE - checking for changes..."
+    fi
   else
-    printf '%s\n' "$FIX_PROMPT" | $CLAUDE_CMD
+    # Supervised mode: user watches output, longer timeout
+    # Note: We use --print mode (like auto) because stdin piping breaks interactive TTY.
+    # The "supervised" aspect is the longer timeout and user watching output.
+    SUPERVISED_TIMEOUT=${RITE_SUPERVISED_TIMEOUT:-3600}  # Default 1 hour
+    print_info "Supervised mode: Running fixes (timeout: ${SUPERVISED_TIMEOUT}s)"
+    print_info "Tool restrictions active: gh, curl, wget blocked"
+
+    set +e
+    if command -v gtimeout >/dev/null 2>&1; then
+      gtimeout "$SUPERVISED_TIMEOUT" $CLAUDE_CMD --print --dangerously-skip-permissions --disallowedTools "$DISALLOWED_TOOLS" < "$FIX_PROMPT_FILE"
+      FIX_EXIT_CODE=$?
+    elif command -v timeout >/dev/null 2>&1; then
+      timeout "$SUPERVISED_TIMEOUT" $CLAUDE_CMD --print --dangerously-skip-permissions --disallowedTools "$DISALLOWED_TOOLS" < "$FIX_PROMPT_FILE"
+      FIX_EXIT_CODE=$?
+    else
+      $CLAUDE_CMD --print --dangerously-skip-permissions --disallowedTools "$DISALLOWED_TOOLS" < "$FIX_PROMPT_FILE"
+      FIX_EXIT_CODE=$?
+    fi
+    set -e
+
+    rm -f "$FIX_PROMPT_FILE"
+
+    if [ "${FIX_EXIT_CODE:-0}" -eq 124 ]; then
+      print_warning "Supervised session timed out after ${SUPERVISED_TIMEOUT}s"
+    fi
   fi
 
-  print_success "Review issues fixed"
+  print_success "Review fix session complete"
 
   # Commit and push the fixes
   print_info "Committing fixes..."
@@ -293,11 +371,22 @@ The workflow will automatically commit, push, and wait for a new review.
 Auto-generated commit addressing issues identified in PR review.
 See PR comments for detailed list of fixes applied.
 
-Changes made via automated workflow (forge --fix-review mode)."
+Changes made via automated workflow (rite --fix-review mode)."
 
   git commit -m "$COMMIT_MSG" || {
-    print_error "No changes to commit"
-    exit 1
+    print_warning "No changes to commit"
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "Possible reasons:"
+    echo "  • Issues were already fixed in a previous commit"
+    echo "  • Claude skipped issues (out-of-scope or protected files)"
+    echo "  • Issues don't require code changes"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    print_info "The cached assessment may be stale"
+    print_info "A new review will see the current state and assess fresh"
+    # Don't exit with error - let workflow continue to request new review
+    # The new review will see current state and assess fresh
   }
 
   print_info "Pushing fixes to remote..."
@@ -499,8 +588,8 @@ else
   if [ -z "${BRANCH_NAME:-}" ]; then
     # No existing branch found - create new branch name
     if [ -z "$ISSUE_DESC" ]; then
-      print_error "Usage: forge <issue-number>"
-      echo "   or: forge \"issue description\""
+      print_error "Usage: rite <issue-number>"
+      echo "   or: rite \"issue description\""
       exit 1
     fi
 
@@ -771,7 +860,7 @@ If the changes are unrelated work, answer UNRELATED."
             print_info "Current worktrees (all have uncommitted work):"
             git worktree list | grep -v "main" | head -3
             echo ""
-            print_info "Tip: Clean up later with: forge cleanup-worktrees"
+            print_info "Tip: Clean up later with: rite cleanup-worktrees"
           fi
         fi
       fi
@@ -934,7 +1023,7 @@ $(if [ -n "$ISSUE_NUMBER" ]; then echo "Closes #$ISSUE_NUMBER"; fi)
 This PR is being worked on. Implementation details will be updated as work progresses.
 
 ---
-_Draft PR created automatically by forge for tracking purposes._"
+_Draft PR created automatically by rite for tracking purposes._"
 
   print_info "Creating draft PR..."
 
@@ -1309,7 +1398,7 @@ if [ "$AUTO_MODE" = false ]; then
   read -p "📝 Create commit? (y/n) " -n 1 -r
   echo
   if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    print_info "Skipped commit. Run forge --continue to resume."
+    print_info "Skipped commit. Run rite --continue to resume."
     exit 0
   fi
 fi

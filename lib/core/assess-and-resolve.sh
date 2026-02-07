@@ -22,6 +22,9 @@ if [ -z "${RITE_LIB_DIR:-}" ]; then
   source "$SCRIPT_DIR/../utils/config.sh"
 fi
 
+# Source review helper for consistent review method handling
+source "$RITE_LIB_DIR/utils/review-helper.sh"
+
 # Redirect all display output to stderr (stdout reserved for filtered content on exit 2)
 exec 3>&1  # Save original stdout for filtered content output
 exec 1>&2  # Redirect stdout to stderr for all print functions
@@ -292,9 +295,9 @@ fi
 
 print_header "📊 PR Review Assessment - PR #$PR_NUMBER"
 
-# Fetch PR review from Claude for GitHub
+# Fetch PR review (from Claude for GitHub bot OR local sharkrite review)
 GH_STDERR=$(mktemp)
-REVIEW_JSON=$(gh pr view "$PR_NUMBER" --json comments --jq '[.comments[] | select(.author.login == "claude" or .author.login == "claude[bot]" or .author.login == "github-actions[bot]")] | .[-1]' 2>"$GH_STDERR") || {
+REVIEW_JSON=$(gh pr view "$PR_NUMBER" --json comments --jq '[.comments[] | select(.author.login == "claude" or .author.login == "claude[bot]" or .author.login == "github-actions[bot]" or (.body | contains("<!-- sharkrite-local-review -->")))] | .[-1]' 2>"$GH_STDERR") || {
   GH_ERROR=$(cat "$GH_STDERR")
   rm -f "$GH_STDERR"
   print_error "Failed to fetch PR #$PR_NUMBER"
@@ -311,8 +314,8 @@ REVIEW_JSON=$(gh pr view "$PR_NUMBER" --json comments --jq '[.comments[] | selec
 rm -f "$GH_STDERR"
 
 if [ "$REVIEW_JSON" = "{}" ] || [ -z "$REVIEW_JSON" ] || [ "$REVIEW_JSON" = "null" ]; then
-  print_error "No review found from Claude for GitHub"
-  echo "Ensure Claude for GitHub app reviewed this PR"
+  print_error "No review found"
+  echo "Run local review: /Users/sarahtime/Dev/forge/lib/core/local-review.sh $PR_NUMBER --post"
   exit 1
 fi
 
@@ -330,26 +333,54 @@ echo "$REVIEW_BODY" > "$REVIEW_FILE"
 print_success "Review fetched from PR #$PR_NUMBER"
 echo ""
 
+# =============================================================================
+# Extract model from review metadata for assessment consistency
+# =============================================================================
+
+extract_review_model() {
+  local review_body="$1"
+  local model=$(echo "$review_body" | grep -oE 'sharkrite-local-review model:[a-z0-9-]+' | sed 's/.*model://' | head -1)
+  if [ -n "$model" ]; then
+    echo "$model"
+  else
+    echo "${RITE_REVIEW_MODEL:-opus}"
+  fi
+}
+
+REVIEW_MODEL=$(extract_review_model "$REVIEW_BODY")
+print_info "Review model: $REVIEW_MODEL"
+export RITE_ASSESSMENT_MODEL="$REVIEW_MODEL"
+
 # Check if review is stale (commits pushed after review)
-print_info "Checking if review is current..."
+# SKIP on retry > 0: We just generated fixes and a new review in the previous cycle.
+# Re-checking for stale would create an infinite loop of regenerating reviews.
+if [ "$RETRY_COUNT" -gt 0 ]; then
+  print_info "Retry $RETRY_COUNT: Skipping stale check (review was generated this cycle)"
+  REVIEW_TIME=$(echo "$REVIEW_JSON" | jq -r '.createdAt' 2>/dev/null)
+else
+  print_info "Checking if review is current..."
+fi
 echo ""
 
 # Get review timestamp
-REVIEW_TIME=$(echo "$REVIEW_JSON" | jq -r '.createdAt' 2>/dev/null)
+REVIEW_TIME="${REVIEW_TIME:-$(echo "$REVIEW_JSON" | jq -r '.createdAt' 2>/dev/null)}"
 
-# Get latest commit timestamp (warn but continue if this fails)
-GH_STDERR=$(mktemp)
-LATEST_COMMIT_TIME=$(gh pr view "$PR_NUMBER" --json commits --jq '.commits[-1].committedDate' 2>"$GH_STDERR") || {
-  GH_ERROR=$(cat "$GH_STDERR")
-  if [ -n "$GH_ERROR" ]; then
-    print_warning "Could not fetch commit timestamps: $GH_ERROR"
-  fi
-  LATEST_COMMIT_TIME=""
-}
-rm -f "$GH_STDERR"
+# Only check for stale reviews on first run (RETRY_COUNT == 0)
+# On retries, we just fixed issues and pushed - the review is from this cycle
+if [ "$RETRY_COUNT" -eq 0 ]; then
+  # Get latest commit timestamp (warn but continue if this fails)
+  GH_STDERR=$(mktemp)
+  LATEST_COMMIT_TIME=$(gh pr view "$PR_NUMBER" --json commits --jq '.commits[-1].committedDate' 2>"$GH_STDERR") || {
+    GH_ERROR=$(cat "$GH_STDERR")
+    if [ -n "$GH_ERROR" ]; then
+      print_warning "Could not fetch commit timestamps: $GH_ERROR"
+    fi
+    LATEST_COMMIT_TIME=""
+  }
+  rm -f "$GH_STDERR"
 
-# Check if there are commits after the review
-if [ -n "$LATEST_COMMIT_TIME" ] && [ -n "$REVIEW_TIME" ]; then
+  # Check if there are commits after the review
+  if [ -n "$LATEST_COMMIT_TIME" ] && [ -n "$REVIEW_TIME" ]; then
   # Convert ISO timestamps to seconds since epoch for reliable comparison
   # Portable date parsing: detect GNU vs BSD date
   if date --version >/dev/null 2>&1; then
@@ -363,14 +394,13 @@ if [ -n "$LATEST_COMMIT_TIME" ] && [ -n "$REVIEW_TIME" ]; then
   fi
 
   if [ "$COMMIT_EPOCH" -gt "$REVIEW_EPOCH" ]; then
-  print_warning "⚠️  Review is stale - commits pushed after review"
-  echo ""
-  echo "Review created: $REVIEW_TIME"
-  echo "Latest commit:  $LATEST_COMMIT_TIME"
+  print_warning "Review is stale - commits pushed after review"
+  echo "  Review created: $REVIEW_TIME"
+  echo "  Latest commit:  $LATEST_COMMIT_TIME"
   echo ""
 
-  # Check if there's a newer review
-  ALL_REVIEWS=$(gh pr view "$PR_NUMBER" --json comments --jq '[.comments[] | select(.author.login == "claude" or .author.login == "github-actions[bot]")] | sort_by(.createdAt) | reverse' 2>/dev/null)
+  # Check if there's a newer review (bot accounts OR local sharkrite reviews)
+  ALL_REVIEWS=$(gh pr view "$PR_NUMBER" --json comments --jq '[.comments[] | select(.author.login == "claude" or .author.login == "github-actions[bot]" or (.body | contains("<!-- sharkrite-local-review -->")))] | sort_by(.createdAt) | reverse' 2>/dev/null)
 
   NEWER_REVIEW_COUNT=$(echo "$ALL_REVIEWS" | jq '[.[] | select(.createdAt > "'"$LATEST_COMMIT_TIME"'")] | length' 2>/dev/null || echo "0")
 
@@ -393,44 +423,41 @@ if [ -n "$LATEST_COMMIT_TIME" ] && [ -n "$REVIEW_TIME" ]; then
     print_success "✓ Using current review (created after latest commit)"
     echo ""
   else
-    print_warning "No new review found after latest commit"
-    print_info "The issues in this review may have been fixed in later commits"
-    echo ""
-
-    # Check if follow-up issues exist for these items
-    FOLLOWUP_ISSUES=$(gh issue list --search "in:title Follow-up.*#$PR_NUMBER" --json number,title,state --jq '.[] | select(.state == "OPEN") | .number' 2>/dev/null || echo "")
-
-    if [ -n "$FOLLOWUP_ISSUES" ]; then
-      FOLLOWUP_COUNT=$(echo "$FOLLOWUP_ISSUES" | wc -l | tr -d ' ')
-      print_info "Found $FOLLOWUP_COUNT open follow-up issue(s) - these items are being tracked"
-
-      # If HIGH issues exist and follow-up issues exist, consider them tracked
-      if [ $HIGH_COUNT -gt 0 ] && [ $FOLLOWUP_COUNT -gt 0 ]; then
-        print_info "Reducing HIGH count by $FOLLOWUP_COUNT (tracked in follow-up issues)"
-        HIGH_COUNT=$((HIGH_COUNT - FOLLOWUP_COUNT))
-        if [ $HIGH_COUNT -lt 0 ]; then
-          HIGH_COUNT=0
-        fi
-      fi
-
-      echo ""
+    # Use shared review helper for consistent stale review handling
+    # This respects RITE_REVIEW_METHOD config (app, local, auto)
+    if [ "$AUTO_MODE" = true ]; then
+      handle_stale_review "$PR_NUMBER" --auto || {
+        print_warning "Could not refresh review"
+        print_info "Continuing with stale review as fallback (issues may already be fixed)"
+      }
     else
-      if [ "$AUTO_MODE" = true ]; then
-        print_warning "Stale review detected in auto mode"
-        print_info "Options:"
-        echo "  1. Request new review: gh pr comment $PR_NUMBER --body '@claude-code please review'"
-        echo "  2. Merge with caution (issues may be fixed)"
-        echo "  3. Create follow-up issues and merge"
-        echo ""
+      handle_stale_review "$PR_NUMBER" || {
+        print_warning "Could not refresh review"
+        print_info "Continuing with stale review as fallback (issues may already be fixed)"
+      }
+    fi
 
-        # In auto mode with stale review, create follow-up issues as safety net
-        print_info "Creating follow-up issues as safety net..."
-        # This will be handled by the CRITICAL/HIGH logic below
+    # Re-fetch the review after posting new one
+    print_info "Fetching updated review..."
+    sleep 2  # Brief pause for GitHub API to reflect new comment
+
+    # Sort by createdAt descending and get the newest review (not just last in array)
+    REVIEW_JSON=$(gh pr view "$PR_NUMBER" --json comments --jq '[.comments[] | select(.author.login == "claude" or .author.login == "claude[bot]" or .author.login == "github-actions[bot]" or (.body | contains("<!-- sharkrite-local-review -->")))] | sort_by(.createdAt) | reverse | .[0]' 2>/dev/null) || true
+
+    if [ -n "$REVIEW_JSON" ] && [ "$REVIEW_JSON" != "null" ]; then
+      REVIEW_BODY=$(echo "$REVIEW_JSON" | jq -r '.body' 2>/dev/null || echo "")
+      REVIEW_TIME=$(echo "$REVIEW_JSON" | jq -r '.createdAt' 2>/dev/null)
+
+      if [ -n "$REVIEW_BODY" ] && [ "$REVIEW_BODY" != "null" ]; then
+        echo "$REVIEW_BODY" > "$REVIEW_FILE"
+        print_success "✅ Fresh review obtained and will be used for assessment"
+        echo ""
       fi
     fi
   fi
   fi
-fi
+  fi
+fi  # End of RETRY_COUNT == 0 stale check block
 
 # ============================================================================
 # RAW REVIEW DISPLAY: Show what Claude will see (compact format for debugging)
@@ -471,19 +498,21 @@ if [ -f "$RITE_LIB_DIR/core/assess-review-issues.sh" ]; then
   # Run smart assessment - pass --auto flag if in auto mode
   # assess-review-issues.sh performs HOLISTIC analysis of entire PR comment
   # and categorizes ALL contents, outputting filtered ACTIONABLE items to stdout
+  # Use process substitution to show stderr in real-time (Claude output streams to terminal)
+  # Pass RETRY_COUNT via environment so assessment can be more strict on later retries
+  ASSESSMENT_STDERR=$(mktemp)
+  export RITE_RETRY_COUNT="$RETRY_COUNT"
   if [ "$AUTO_MODE" = true ]; then
-    ASSESSMENT_STDERR=$(mktemp)
-    ASSESSMENT_RESULT=$("$RITE_LIB_DIR/core/assess-review-issues.sh" "$PR_NUMBER" "$REVIEW_FILE" --auto 2>"$ASSESSMENT_STDERR")
+    ASSESSMENT_RESULT=$("$RITE_LIB_DIR/core/assess-review-issues.sh" "$PR_NUMBER" "$REVIEW_FILE" --auto 2> >(tee "$ASSESSMENT_STDERR" >&2))
     ASSESSMENT_EXIT_CODE=$?
-    ASSESSMENT_ERROR=$(cat "$ASSESSMENT_STDERR")
-    rm -f "$ASSESSMENT_STDERR"
   else
-    ASSESSMENT_STDERR=$(mktemp)
-    ASSESSMENT_RESULT=$("$RITE_LIB_DIR/core/assess-review-issues.sh" "$PR_NUMBER" "$REVIEW_FILE" 2>"$ASSESSMENT_STDERR")
+    ASSESSMENT_RESULT=$("$RITE_LIB_DIR/core/assess-review-issues.sh" "$PR_NUMBER" "$REVIEW_FILE" 2> >(tee "$ASSESSMENT_STDERR" >&2))
     ASSESSMENT_EXIT_CODE=$?
-    ASSESSMENT_ERROR=$(cat "$ASSESSMENT_STDERR")
-    rm -f "$ASSESSMENT_STDERR"
   fi
+  # Wait for tee subprocess to finish writing
+  wait
+  ASSESSMENT_ERROR=$(cat "$ASSESSMENT_STDERR")
+  rm -f "$ASSESSMENT_STDERR"
 
   if [ $ASSESSMENT_EXIT_CODE -eq 0 ] && [ -n "$ASSESSMENT_RESULT" ] && [ "$ASSESSMENT_RESULT" != "ALL_ITEMS" ]; then
     print_success "Smart assessment complete - three-state categorization applied"
@@ -509,7 +538,7 @@ if [ -f "$RITE_LIB_DIR/core/assess-review-issues.sh" ]; then
     echo "📊 Assessment Summary:"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     print_info "  • ACTIONABLE_NOW: $ACTIONABLE_NOW_COUNT items (fix in this PR)"
-    print_info "  • ACTIONABLE_LATER: $ACTIONABLE_LATER_COUNT items (defer to security-debt)"
+    print_info "  • ACTIONABLE_LATER: $ACTIONABLE_LATER_COUNT items (defer to tech-debt)"
     print_info "  • DISMISSED: $DISMISSED_COUNT items (not worth tracking)"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
@@ -525,11 +554,11 @@ if [ -f "$RITE_LIB_DIR/core/assess-review-issues.sh" ]; then
       exit 0
 
     elif [ "$ACTIONABLE_NOW_COUNT" -eq 0 ] && [ "$ACTIONABLE_LATER_COUNT" -gt 0 ]; then
-      # Only ACTIONABLE_LATER items - create security-debt issue and merge
+      # Only ACTIONABLE_LATER items - create tech-debt issue and merge
       print_info "✅ No immediate fixes needed"
-      print_info "📝 Creating security-debt issue for $ACTIONABLE_LATER_COUNT deferred items..."
+      print_info "📝 Creating tech-debt issue for $ACTIONABLE_LATER_COUNT deferred items..."
 
-      # Set flag to create security-debt issue, then exit 0 to allow merge
+      # Set flag to create tech-debt issue, then exit 0 to allow merge
       CREATE_SECURITY_DEBT=true
       FILTERED_ASSESSMENT="$ASSESSMENT_RESULT"
       # Will create issue below, then exit 0
@@ -553,7 +582,7 @@ if [ -f "$RITE_LIB_DIR/core/assess-review-issues.sh" ]; then
           FILTERED_ASSESSMENT="$ASSESSMENT_RESULT"
         else
           print_info "✅ No CRITICAL items remain (only HIGH/MEDIUM/LOW)"
-          print_info "Creating security-debt issue for remaining items..."
+          print_info "Creating tech-debt issue for remaining items..."
           # Treat remaining ACTIONABLE_NOW as ACTIONABLE_LATER at retry limit
           CREATE_SECURITY_DEBT=true
           FILTERED_ASSESSMENT="$ASSESSMENT_RESULT"
@@ -561,7 +590,27 @@ if [ -f "$RITE_LIB_DIR/core/assess-review-issues.sh" ]; then
 
         # Also handle ACTIONABLE_LATER items if they exist
         if [ "$ACTIONABLE_LATER_COUNT" -gt 0 ]; then
-          print_info "Note: $ACTIONABLE_LATER_COUNT ACTIONABLE_LATER items will also be included in security-debt"
+          print_info "Note: $ACTIONABLE_LATER_COUNT ACTIONABLE_LATER items will also be included in tech-debt"
+        fi
+
+        # Extract counts from FILTERED_ASSESSMENT for Issue Summary display
+        # This ensures counts are populated before the summary is shown
+        # Format: "### Title - ACTIONABLE_NOW" on one line, "**Severity:** CRITICAL" on another
+        if [ -n "${FILTERED_ASSESSMENT:-}" ]; then
+          # Extract actionable items (excluding DISMISSED), then count by severity
+          _ACTIONABLE_ITEMS=$(echo "$FILTERED_ASSESSMENT" | grep -E "ACTIONABLE_(NOW|LATER)" || echo "")
+          if [ -n "$_ACTIONABLE_ITEMS" ]; then
+            # Get context around each actionable item to find severity
+            CRITICAL_COUNT=$(echo "$FILTERED_ASSESSMENT" | grep -E -B2 -A5 "ACTIONABLE_NOW|ACTIONABLE_LATER" | grep -c "Severity:.*CRITICAL" 2>/dev/null) || true
+            HIGH_COUNT=$(echo "$FILTERED_ASSESSMENT" | grep -E -B2 -A5 "ACTIONABLE_NOW|ACTIONABLE_LATER" | grep -c "Severity:.*HIGH" 2>/dev/null) || true
+            MEDIUM_COUNT=$(echo "$FILTERED_ASSESSMENT" | grep -E -B2 -A5 "ACTIONABLE_NOW|ACTIONABLE_LATER" | grep -c "Severity:.*MEDIUM" 2>/dev/null) || true
+            LOW_COUNT=$(echo "$FILTERED_ASSESSMENT" | grep -E -B2 -A5 "ACTIONABLE_NOW|ACTIONABLE_LATER" | grep -c "Severity:.*LOW" 2>/dev/null) || true
+          fi
+          # Ensure numeric defaults
+          CRITICAL_COUNT=${CRITICAL_COUNT:-0}
+          HIGH_COUNT=${HIGH_COUNT:-0}
+          MEDIUM_COUNT=${MEDIUM_COUNT:-0}
+          LOW_COUNT=${LOW_COUNT:-0}
         fi
 
       else
@@ -662,13 +711,13 @@ if [ "${CREATE_CRITICAL_FOLLOWUP:-false}" = "false" ] && [ "${CREATE_SECURITY_DE
   exit 0
 fi
 
-# Handle security-debt case (retry limit reached, no CRITICAL items)
+# Handle tech-debt case (retry limit reached, no CRITICAL items)
 if [ "${CREATE_SECURITY_DEBT:-false}" = "true" ]; then
-  print_info "Creating security-debt issue with remaining HIGH/MEDIUM/LOW items..."
+  print_info "Creating tech-debt issue with remaining HIGH/MEDIUM/LOW items..."
 
-  # Use filtered review for security-debt issue
-  FOLLOWUP_LABEL="security-debt"
-  FOLLOWUP_TITLE="Security Debt: Review feedback from PR #$PR_NUMBER"
+  # Use filtered review for tech-debt issue
+  FOLLOWUP_LABEL="tech-debt"
+  FOLLOWUP_TITLE="Tech Debt: Review feedback from PR #$PR_NUMBER"
   CREATE_FOLLOWUP_ISSUES=true
   CREATE_LOW_BATCH=false  # Items already grouped in filtered review
 fi
@@ -701,7 +750,7 @@ if [ "${CREATE_FOLLOWUP_ISSUES:-false}" = true ]; then
   if [ "$USE_FILTERED" = true ] && [ -n "$FILTERED_CONTENT" ]; then
     # Determine which items to include based on issue type
     if [ "${CREATE_SECURITY_DEBT:-false}" = "true" ]; then
-      print_info "Extracting ACTIONABLE_LATER items for security-debt issue..."
+      print_info "Extracting ACTIONABLE_LATER items for tech-debt issue..."
       CRITICAL_ISSUES=$(echo "$FILTERED_CONTENT" | grep -B2 -A 20 "ACTIONABLE_LATER" | grep -B2 -A 20 "CRITICAL" || echo "")
       HIGH_ISSUES=$(echo "$FILTERED_CONTENT" | grep -B2 -A 20 "ACTIONABLE_LATER" | grep -B2 -A 20 "HIGH" || echo "")
       MEDIUM_ISSUES=$(echo "$FILTERED_CONTENT" | grep -B2 -A 20 "ACTIONABLE_LATER" | grep -B2 -A 20 "MEDIUM" || echo "")
@@ -725,11 +774,16 @@ $(echo "$FILTERED_CONTENT" | grep -B2 -A 20 "ACTIONABLE_NOW" | grep -B2 -A 20 "L
       LOW_ISSUES=$(echo "$FILTERED_CONTENT" | grep -B2 -A 20 "ACTIONABLE" | grep -B2 -A 20 "LOW" || echo "")
     fi
 
-    # Recount after filtering
-    CRITICAL_COUNT=$(echo "$CRITICAL_ISSUES" | grep -c -E "ACTIONABLE_(NOW|LATER)" || echo "0")
-    HIGH_COUNT=$(echo "$HIGH_ISSUES" | grep -c -E "ACTIONABLE_(NOW|LATER)" || echo "0")
-    MEDIUM_COUNT=$(echo "$MEDIUM_ISSUES" | grep -c -E "ACTIONABLE_(NOW|LATER)" || echo "0")
-    LOW_COUNT=$(echo "$LOW_ISSUES" | grep -c -E "ACTIONABLE_(NOW|LATER)" || echo "0")
+    # Recount after filtering (grep -c returns exit 1 on no match but still outputs "0")
+    CRITICAL_COUNT=$(echo "$CRITICAL_ISSUES" | grep -c -E "ACTIONABLE_(NOW|LATER)" 2>/dev/null) || true
+    HIGH_COUNT=$(echo "$HIGH_ISSUES" | grep -c -E "ACTIONABLE_(NOW|LATER)" 2>/dev/null) || true
+    MEDIUM_COUNT=$(echo "$MEDIUM_ISSUES" | grep -c -E "ACTIONABLE_(NOW|LATER)" 2>/dev/null) || true
+    LOW_COUNT=$(echo "$LOW_ISSUES" | grep -c -E "ACTIONABLE_(NOW|LATER)" 2>/dev/null) || true
+    # Ensure numeric defaults
+    CRITICAL_COUNT=${CRITICAL_COUNT:-0}
+    HIGH_COUNT=${HIGH_COUNT:-0}
+    MEDIUM_COUNT=${MEDIUM_COUNT:-0}
+    LOW_COUNT=${LOW_COUNT:-0}
 
     print_info "Issue counts: CRITICAL=$CRITICAL_COUNT, HIGH=$HIGH_COUNT, MEDIUM=$MEDIUM_COUNT, LOW=$LOW_COUNT"
   else
@@ -841,7 +895,7 @@ _Auto-generated consolidated follow-up from PR review_"
     echo ""
     print_success "📋 Follow-up issue already exists: #$EXISTING_ISSUE"
     print_info "Skipping duplicate issue creation"
-    local issue_url=$(gh issue view "$EXISTING_ISSUE" --json url --jq '.url' 2>/dev/null || echo "")
+    issue_url=$(gh issue view "$EXISTING_ISSUE" --json url --jq '.url' 2>/dev/null || echo "")
     echo "  URL: $issue_url"
     echo ""
 
@@ -850,11 +904,11 @@ _Auto-generated consolidated follow-up from PR review_"
   else
     # Determine label type based on context and severity
     if [ "${CREATE_SECURITY_DEBT:-false}" = "true" ]; then
-      ISSUE_LABELS="security-debt,parent-pr:$PR_NUMBER"
+      ISSUE_LABELS="tech-debt,parent-pr:$PR_NUMBER"
     elif [ "$CRITICAL_COUNT" -gt 0 ]; then
       ISSUE_LABELS="review-follow-up,parent-pr:$PR_NUMBER"
     else
-      ISSUE_LABELS="security-debt,parent-pr:$PR_NUMBER"
+      ISSUE_LABELS="tech-debt,parent-pr:$PR_NUMBER"
     fi
 
     # Add priority labels based on highest severity
@@ -867,23 +921,23 @@ _Auto-generated consolidated follow-up from PR review_"
     fi
 
     # Create consolidated follow-up issue
-    FOLLOWUP_ISSUE=$(gh issue create \
+    FOLLOWUP_ISSUE=""
+    if FOLLOWUP_ISSUE=$(gh issue create \
       --title "$ISSUE_TITLE" \
       --body "$FOLLOWUP_BODY" \
       --label "$ISSUE_LABELS" \
-      2>&1 || echo "")
-
-    if [ -n "$FOLLOWUP_ISSUE" ]; then
-      FOLLOWUP_NUMBER=$(echo "$FOLLOWUP_ISSUE" | grep -oE '[0-9]+$')
+      2>&1); then
+      FOLLOWUP_NUMBER=$(echo "$FOLLOWUP_ISSUE" | grep -oE '[0-9]+$' || echo "")
       echo ""
       print_success "✅ Follow-up issue created: #$FOLLOWUP_NUMBER"
       echo "  URL: $FOLLOWUP_ISSUE"
-      echo "  Type: ${CREATE_SECURITY_DEBT:+Security Debt}${CREATE_SECURITY_DEBT:-Review Follow-up}"
+      echo "  Type: ${CREATE_SECURITY_DEBT:+Tech Debt}${CREATE_SECURITY_DEBT:-Review Follow-up}"
       echo "  Items: NOW=${ACTIONABLE_NOW_COUNT:-0}, LATER=${ACTIONABLE_LATER_COUNT:-0} (total in issue)"
       echo ""
 
-      # Comment on PR with link to follow-up
-      COMMENT_BODY="📋 **Consolidated follow-up issue created:** #$FOLLOWUP_NUMBER
+      # Comment on PR with link to follow-up (includes machine-readable marker for workflow detection)
+      COMMENT_BODY="<!-- sharkrite-followup-issue:$FOLLOWUP_NUMBER -->
+📋 **Consolidated follow-up issue created:** #$FOLLOWUP_NUMBER
 
 All review feedback has been grouped into a single issue for batch processing:
 - 🔴 HIGH priority: $HIGH_COUNT

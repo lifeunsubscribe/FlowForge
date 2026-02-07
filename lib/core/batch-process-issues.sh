@@ -3,9 +3,9 @@
 # Batch process multiple GitHub issues in unsupervised mode
 # Usage:
 #   forge 19 21 31 32              # Process specific issues
-#   forge --label bug              # Process all issues with label
-#   forge --milestone v1.0         # Process all issues in milestone
-#   forge --followup               # Auto-discover follow-up pairs (max 4)
+#   rite --label bug              # Process all issues with label
+#   rite --milestone v1.0         # Process all issues in milestone
+#   rite --followup               # Auto-discover follow-up pairs (max 4)
 #
 # Features:
 #   - Unsupervised batch processing (--auto mode for all issues)
@@ -105,14 +105,14 @@ if [ -n "$FILTER_TYPE" ]; then
 
   case "$FILTER_TYPE" in
     followup)
-      print_info "🔍 Security Debt Management Mode"
+      print_info "🔍 Tech Debt Management Mode"
       echo ""
 
-      # Fetch all security-debt issues with full body content
-      DEBT_ISSUES=$(gh issue list --label "security-debt" --state open --json number,title,labels,body 2>/dev/null || echo "")
+      # Fetch all tech-debt issues with full body content
+      DEBT_ISSUES=$(gh issue list --label "tech-debt" --state open --json number,title,labels,body 2>/dev/null || echo "")
 
       if [ -z "$DEBT_ISSUES" ]; then
-        print_success "No security debt issues found - clean slate!"
+        print_success "No tech debt issues found - clean slate!"
         exit 0
       fi
 
@@ -153,8 +153,8 @@ if [ -n "$FILTER_TYPE" ]; then
 
       TOTAL_TASKS=$((HIGH_TASKS + MEDIUM_TASKS + LOW_TASKS))
 
-      # Generate comprehensive security debt report
-      print_header "📊 Security Debt Report"
+      # Generate comprehensive tech debt report
+      print_header "📊 Tech Debt Report"
       echo -e "${YELLOW}Total Outstanding: $TOTAL_DEBT issue(s) containing $TOTAL_TASKS task(s)${NC}"
       echo ""
 
@@ -171,7 +171,7 @@ if [ -n "$FILTER_TYPE" ]; then
       echo ""
 
       # Show detailed breakdown of what each issue concerns
-      print_info "Issues in Security Debt:"
+      print_info "Issues in Tech Debt:"
       echo ""
       echo "$DEBT_ISSUES" | jq -s '.[:8]' | jq -r '.[] |
         "  #\(.number): \(.title)" +
@@ -190,7 +190,7 @@ if [ -n "$FILTER_TYPE" ]; then
       MAX_ISSUES="${RITE_MAX_ISSUES_PER_SESSION:-8}"
       ISSUE_LIST=($(echo "$DEBT_ISSUES" | jq -r '.number' | head -$MAX_ISSUES))
 
-      print_success "Queued ${#ISSUE_LIST[@]} security-debt issues for processing"
+      print_success "Queued ${#ISSUE_LIST[@]} tech-debt issues for processing"
       echo ""
       ;;
     label)
@@ -220,9 +220,9 @@ if [ ${#ISSUE_LIST[@]} -eq 0 ]; then
   echo ""
   echo "Usage:"
   echo "  forge 19 21 31 32              # Process specific issues"
-  echo "  forge --label bug              # Process all issues with label"
-  echo "  forge --milestone v1.0         # Process all issues in milestone"
-  echo "  forge --followup               # Auto-discover follow-up pairs (max 4)"
+  echo "  rite --label bug              # Process all issues with label"
+  echo "  rite --milestone v1.0         # Process all issues in milestone"
+  echo "  rite --followup               # Auto-discover follow-up pairs (max 4)"
   echo ""
   exit 1
 fi
@@ -242,7 +242,7 @@ SKIPPED_ISSUES=()
 # NOTE: Associative arrays require bash 4+, but macOS ships with bash 3.2
 # For now, skipping detailed status tracking - using simple indexed arrays instead
 declare -a SECURITY_UPDATES=()   # Track security doc updates
-declare -a NEW_ISSUES_CREATED=() # Track new security-debt issues
+declare -a NEW_ISSUES_CREATED=() # Track new tech-debt issues
 declare -a FAILED_PAIRS=()       # Track failed parent-child pairs
 
 print_header "🚀 Batch Processing Started"
@@ -499,10 +499,10 @@ for ISSUE_NUM in "${ISSUE_LIST[@]}"; do
             print_warning "⏱️  Timeout: No review after 15 minutes"
 
             # Send Slack notification
-            send_notification "⏱️ Manual Intervention Needed" "Issue #$ISSUE_NUM: PR #$EXISTING_PR timeout waiting for review. Run: \`forge $ISSUE_NUM\`" "warning"
+            send_notification "⏱️ Manual Intervention Needed" "Issue #$ISSUE_NUM: PR #$EXISTING_PR timeout waiting for review. Run: \`rite $ISSUE_NUM\`" "warning"
 
             print_info "📱 Slack notification sent"
-            print_info "Manual run needed: forge $ISSUE_NUM"
+            print_info "Manual run needed: rite $ISSUE_NUM"
             echo ""
 
             SKIPPED_ISSUES+=("$ISSUE_NUM")
@@ -573,8 +573,8 @@ for ISSUE_NUM in "${ISSUE_LIST[@]}"; do
         SECURITY_UPDATES+=("PR #$PR_NUMBER: Updated DEVELOPMENT-GUIDE.md with findings from #$ISSUE_NUM")
       fi
 
-      # Check for new security-debt issues created
-      NEW_DEBT_ISSUE=$(gh issue list --label "security-debt,parent-pr:$PR_NUMBER" --state open --json number --jq '.[0].number' 2>/dev/null || echo "")
+      # Check for new tech-debt issues created
+      NEW_DEBT_ISSUE=$(gh issue list --label "tech-debt,parent-pr:$PR_NUMBER" --state open --json number --jq '.[0].number' 2>/dev/null || echo "")
       if [ -n "$NEW_DEBT_ISSUE" ]; then
         NEW_ISSUES_CREATED+=("Issue #$NEW_DEBT_ISSUE (from PR #$PR_NUMBER)")
       fi
@@ -783,7 +783,7 @@ fi
 if [ ${#NEW_ISSUES_CREATED[@]} -gt 0 ]; then
   NOTIFICATION_MESSAGE="$NOTIFICATION_MESSAGE
 
-*📝 New \`security-debt\` Issues:*"
+*📝 New \`tech-debt\` Issues:*"
   for issue in "${NEW_ISSUES_CREATED[@]}"; do
     NOTIFICATION_MESSAGE="$NOTIFICATION_MESSAGE
 • $issue"
@@ -798,7 +798,7 @@ if [ ${#BLOCKED_ISSUES[@]} -gt 0 ]; then
   for ISSUE_NUM in "${BLOCKED_ISSUES[@]}"; do
     PR_NUM=${ISSUE_PR[$ISSUE_NUM]:-"N/A"}
     NOTIFICATION_MESSAGE="$NOTIFICATION_MESSAGE
-• Issue #$ISSUE_NUM (PR #$PR_NUM) - Run: \`forge $ISSUE_NUM\`"
+• Issue #$ISSUE_NUM (PR #$PR_NUM) - Run: \`rite $ISSUE_NUM\`"
   done
 fi
 
@@ -873,7 +873,7 @@ echo "Remaining issues: ${resume_list[*]}"
 echo ""
 
 # Resume with remaining issues
-forge ${resume_list[*]}
+rite ${resume_list[*]}
 EOF
 
   chmod +x "$resume_script"

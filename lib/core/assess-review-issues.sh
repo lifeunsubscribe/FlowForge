@@ -27,6 +27,86 @@ fi
 
 source "$RITE_LIB_DIR/utils/colors.sh"
 
+# =============================================================================
+# CACHING: SHA256 hash of review content for deterministic cache key
+# =============================================================================
+
+generate_cache_key() {
+  local review_content="$1"
+  local model="${2:-${RITE_REVIEW_MODEL:-opus}}"
+  local cache_input="${review_content}::model=${model}"
+
+  if command -v shasum >/dev/null 2>&1; then
+    echo "$cache_input" | shasum -a 256 | cut -d' ' -f1
+  elif command -v sha256sum >/dev/null 2>&1; then
+    echo "$cache_input" | sha256sum | cut -d' ' -f1
+  else
+    echo "$cache_input" | md5 | cut -d' ' -f1
+  fi
+}
+
+get_cached_assessment() {
+  local cache_key="$1"
+  local cache_file="$RITE_PROJECT_ROOT/$RITE_ASSESSMENT_CACHE_DIR/${cache_key}.json"
+
+  if [ -f "$cache_file" ]; then
+    cat "$cache_file"
+    return 0
+  fi
+  return 1
+}
+
+save_to_cache() {
+  local cache_key="$1"
+  local assessment="$2"
+  local model="${3:-${RITE_REVIEW_MODEL:-opus}}"
+  local cache_dir="$RITE_PROJECT_ROOT/$RITE_ASSESSMENT_CACHE_DIR"
+
+  mkdir -p "$cache_dir"
+  echo "$assessment" > "$cache_dir/${cache_key}.json"
+
+  # Store metadata for targeted cleanup
+  cat > "$cache_dir/${cache_key}.meta" << EOF
+{
+  "created": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "model": "$model",
+  "pr_number": "$PR_NUMBER"
+}
+EOF
+  print_info "Cached assessment for PR #$PR_NUMBER (key: ${cache_key:0:12}...)" >&2
+}
+
+# =============================================================================
+# JSON SCHEMA: Structured output schema for deterministic parsing (internal)
+# =============================================================================
+# NOTE: This schema is defined for future use with Claude CLI's --output-format json
+# Currently unused because existing parsing expects markdown format.
+# TODO: Migrate to JSON output once downstream parsing is updated.
+
+ASSESSMENT_JSON_SCHEMA='{
+  "type": "object",
+  "properties": {
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "title": {"type": "string"},
+          "state": {"enum": ["ACTIONABLE_NOW", "ACTIONABLE_LATER", "DISMISSED"]},
+          "severity": {"enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW"]},
+          "category": {"enum": ["Security", "CodeQuality", "Standards", "ScopeCreep", "QuickWin"]},
+          "reasoning": {"type": "string"},
+          "context": {"type": "string"},
+          "fix_effort": {"type": "string"},
+          "defer_reason": {"type": "string"}
+        },
+        "required": ["title", "state", "severity", "category", "reasoning"]
+      }
+    }
+  },
+  "required": ["items"]
+}'
+
 PR_NUMBER="$1"
 REVIEW_FILE="$2"
 AUTO_MODE=false
@@ -46,6 +126,55 @@ print_info "Assessing review issues with Claude..."
 
 # Read full review content
 REVIEW_CONTENT=$(cat "$REVIEW_FILE")
+
+# Retry-aware strictness: On retry 2+, only CRITICAL issues should be ACTIONABLE_NOW
+RETRY_COUNT="${RITE_RETRY_COUNT:-0}"
+if [ "$RETRY_COUNT" -ge 2 ]; then
+  RETRY_MODE_INSTRUCTIONS="
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚠️  RETRY MODE (Attempt $RETRY_COUNT/3) - STRICT ASSESSMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+This PR has already gone through multiple fix cycles. To prevent infinite loops:
+
+ACTIONABLE_NOW ONLY FOR:
+  - CRITICAL security vulnerabilities that MUST be fixed before merge
+  - Nothing else
+
+ALL OTHER ISSUES → ACTIONABLE_LATER or DISMISSED
+  - HIGH bugs → ACTIONABLE_LATER (create follow-up issue)
+  - MEDIUM issues → ACTIONABLE_LATER or DISMISSED
+  - LOW suggestions → DISMISSED
+  - Anything marked 'consider' or 'might want to' → DISMISSED
+
+The goal is to CLOSE THIS PR, not achieve perfection.
+Technical debt issues will be tracked in a follow-up issue.
+
+"
+  print_warning "Retry $RETRY_COUNT: Using strict assessment mode (only CRITICAL → ACTIONABLE_NOW)"
+elif [ "$RETRY_COUNT" -eq 1 ]; then
+  RETRY_MODE_INSTRUCTIONS="
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ℹ️  RETRY MODE (Attempt 1/3) - FOCUSED ASSESSMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+This is a retry after previous fixes. Be more conservative:
+
+ACTIONABLE_NOW ONLY FOR:
+  - CRITICAL security vulnerabilities
+  - HIGH bugs that directly break the feature being implemented
+
+ACTIONABLE_LATER FOR:
+  - Everything else that's a valid concern
+
+DISMISSED FOR:
+  - Style preferences, suggestions, 'nice to have'
+
+"
+  print_info "Retry 1: Using focused assessment mode"
+else
+  RETRY_MODE_INSTRUCTIONS=""
+fi
 
 # Get original issue context for scope assessment
 ISSUE_CONTEXT=$(gh pr view "$PR_NUMBER" --json body --jq '.body' 2>/dev/null | grep -oE 'Closes #[0-9]+|Fixes #[0-9]+|Resolves #[0-9]+' | head -1 | grep -oE '[0-9]+' || echo "")
@@ -146,6 +275,23 @@ export CLAUDE_ERROR_TYPE=""
 
 # Create assessment prompt for Claude
 ASSESSMENT_PROMPT="You are assessing a code review.
+${RETRY_MODE_INSTRUCTIONS}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DETERMINISM REQUIREMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+You MUST be consistent in your classifications.
+Given identical input, you MUST produce identical output.
+
+Rules:
+- Do NOT use probabilistic language (\"might\", \"could\", \"possibly\")
+- Make DEFINITIVE decisions for each item
+- When genuinely uncertain between two classifications, ALWAYS choose
+  the more conservative option (but see RETRY MODE above if present):
+    * ACTIONABLE_NOW over ACTIONABLE_LATER
+    * ACTIONABLE_LATER over DISMISSED
+- Apply the same reasoning pattern to similar issues
+- Do NOT introduce randomness in your decision-making
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ORIGINAL ISSUE SCOPE:
@@ -182,28 +328,30 @@ For EVERY finding, suggestion, or improvement mentioned:
 THREE-STATE CATEGORIZATION:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-ACTIONABLE_NOW - Fix in this PR cycle:
-  - CRITICAL security vulnerabilities (always)
-  - HIGH security issues (unless documented as accepted)
-  - MEDIUM bugs that could cause production issues
-  - Standards violations (breaks documented conventions)
-  - Quick wins (<10 min effort, high impact)
-  - Anything that blocks shipping a secure, functional product
+ACTIONABLE_NOW - Fix in this PR cycle (BE CONSERVATIVE):
+  - CRITICAL security vulnerabilities (always, no exceptions)
+  - HIGH bugs that would BREAK the specific feature being implemented
+  - Issues that make the PR UNMERGEABLE (build fails, tests fail)
+  - NOTHING ELSE unless explicitly in the original issue scope
 
-ACTIONABLE_LATER - Valid but defer to follow-up issue:
-  - Improvements that EXCEED PR scope but align with project goals
-  - Valid refactoring that would take >1 hour
-  - Architectural improvements (good ideas, not urgent)
-  - Scope creep: \"This is good, but belongs in separate PR\"
-  - Nice-to-haves under time constraints
-  - Reserve for genuine improvements only (not everything!)
+ACTIONABLE_LATER - Valid concern, create follow-up issue:
+  - HIGH issues that don't block this specific feature
+  - MEDIUM bugs and quality issues
+  - Refactors and improvements (even good ones!)
+  - Test coverage gaps in code NOT directly related to the issue
+  - \"While we're here\" fixes
+  - Standards violations that don't break functionality
 
 DISMISSED - Not worth tracking:
   - Pure style preferences (no functional impact)
+  - Suggestions using words like \"consider\", \"might\", \"could\"
   - Theoretical edge cases (unlikely in production)
   - Over-engineering (premature optimization)
   - Already documented as accepted patterns
-  - Doesn't align with project goals
+  - Improvements to unrelated code
+  - \"Nice to have\" without clear, immediate benefit
+  - LOW priority items (almost always dismissed)
+  - Anything not in the original issue scope AND not a security issue
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 OUTPUT FORMAT:
@@ -238,33 +386,57 @@ CATEGORY GUIDE:
 CRITICAL DECISION CRITERIA:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-SCOPE ASSESSMENT:
-  - Compare review findings to original issue description
-  - If finding relates to files NOT mentioned in issue -> check fix effort
-  - If finding improves area BEYOND issue's stated goal -> check fix effort
+CONSERVATIVE SCOPE ASSESSMENT (prefer deferral over expansion):
+  - The ORIGINAL ISSUE SCOPE above defines what this PR is for
+  - ONLY mark ACTIONABLE_NOW if the issue is:
+    * A CRITICAL security vulnerability (always fix)
+    * A HIGH bug that would break the specific feature being changed
+    * Directly blocking the original issue from being complete
+  - Everything else should be ACTIONABLE_LATER or DISMISSED
+  - \"Scope creep\" includes:
+    * Improvements to code not in the original issue
+    * Refactors that weren't requested
+    * Style/quality issues that don't affect functionality
+    * \"While we're here\" fixes
 
-  QUICK WIN SCOPE CREEP (fix immediately):
-    If scope creep BUT fix takes <10 minutes -> ACTIONABLE_NOW
-    Example: Issue targets file A, review suggests same change to file B
-             If it's copy-paste or trivial extension -> ACTIONABLE_NOW
+STRICT SCOPE BOUNDARY:
+  - If it wasn't in the original issue description → DISMISSED or ACTIONABLE_LATER
+  - If it's a \"nice to have\" or \"improvement\" → ACTIONABLE_LATER at best
+  - If the reviewer says \"consider\" or \"might want to\" → DISMISSED
+  - Only CRITICAL security issues can expand scope beyond original issue
+  - A reasonable engineer would include it if they noticed it
 
-  DEFERRED SCOPE CREEP (track for later):
-    If scope creep AND fix takes >10 minutes -> ACTIONABLE_LATER
+DEFER ONLY IF:
+  - Large refactor requiring architectural changes (>1 hour)
+  - Touches completely unrelated code/systems
+  - Requires design discussion or new dependencies
+  - Would need its own test suite or documentation update
 
-TIME CONSTRAINTS:
-  - Quick fixes (<10 min) -> ACTIONABLE_NOW (no reason to defer)
-  - Medium effort (30min-1hr) -> Depends on severity
-  - Large refactors (>1hr) -> ACTIONABLE_LATER unless CRITICAL
-
-PREVENTING ISSUE PILE-UP:
-  - Be selective with ACTIONABLE_LATER (not a dumping ground!)
-  - Ask: 'Will we realistically fix this in next 3 months?'
-  - If no -> DISMISSED (don't track things we won't do)
-  - Reserve ACTIONABLE_LATER for improvements we WANT to do, just not NOW
+DISMISS IF:
+  - Pure style preference with no functional benefit
+  - Unrelated to files being modified
+  - Hypothetical concern without evidence
+  - Already documented as intentional
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 IMPORTANT: Read the ENTIRE review. Don't just look for numbered lists - assess ALL findings, suggestions, and improvements mentioned anywhere in the review (including sections like 'Minor Suggestions', 'Nice to Have', 'Optional Improvements', etc.)."
+
+# =============================================================================
+# CACHE CHECK: Return cached result if available
+# =============================================================================
+
+# Determine effective model (from review metadata or config)
+EFFECTIVE_MODEL="${RITE_ASSESSMENT_MODEL:-${RITE_REVIEW_MODEL:-opus}}"
+
+# Generate cache key and check for cached result
+CACHE_KEY=$(generate_cache_key "$REVIEW_CONTENT" "$EFFECTIVE_MODEL")
+
+if CACHED_RESULT=$(get_cached_assessment "$CACHE_KEY" 2>/dev/null); then
+  print_success "Using cached assessment (key: ${CACHE_KEY:0:12}...)"
+  echo "$CACHED_RESULT"
+  exit 0
+fi
 
 print_info "Running Claude assessment (this may take 30-60 seconds)..."
 
@@ -281,18 +453,25 @@ if [ "$AUTO_MODE" = true ]; then
   # Capture stderr to debug issues while keeping stdout clean for piping
   CLAUDE_STDERR=$(mktemp)
 
+  # Build Claude args with model flag for consistency
+  CLAUDE_ARGS="--print --dangerously-skip-permissions"
+  if [ -n "$EFFECTIVE_MODEL" ]; then
+    CLAUDE_ARGS="$CLAUDE_ARGS --model $EFFECTIVE_MODEL"
+  fi
+
   # Run Claude assessment with timeout (use gtimeout on macOS if available)
+  # Use tee to display output while also capturing it
   if command -v gtimeout >/dev/null 2>&1; then
-    ASSESSMENT_OUTPUT=$(echo "$ASSESSMENT_PROMPT" | gtimeout "$ASSESSMENT_TIMEOUT" claude --print --dangerously-skip-permissions 2>"$CLAUDE_STDERR")
-    ASSESSMENT_EXIT_CODE=$?
+    ASSESSMENT_OUTPUT=$(echo "$ASSESSMENT_PROMPT" | gtimeout "$ASSESSMENT_TIMEOUT" claude $CLAUDE_ARGS 2>"$CLAUDE_STDERR" | tee /dev/stderr)
+    ASSESSMENT_EXIT_CODE=${PIPESTATUS[1]}
   elif command -v timeout >/dev/null 2>&1; then
-    ASSESSMENT_OUTPUT=$(echo "$ASSESSMENT_PROMPT" | timeout "$ASSESSMENT_TIMEOUT" claude --print --dangerously-skip-permissions 2>"$CLAUDE_STDERR")
-    ASSESSMENT_EXIT_CODE=$?
+    ASSESSMENT_OUTPUT=$(echo "$ASSESSMENT_PROMPT" | timeout "$ASSESSMENT_TIMEOUT" claude $CLAUDE_ARGS 2>"$CLAUDE_STDERR" | tee /dev/stderr)
+    ASSESSMENT_EXIT_CODE=${PIPESTATUS[1]}
   else
     # No timeout available - run without timeout (macOS default)
     print_info "Running without timeout (install coreutils for timeout support: brew install coreutils)"
-    ASSESSMENT_OUTPUT=$(echo "$ASSESSMENT_PROMPT" | claude --print --dangerously-skip-permissions 2>"$CLAUDE_STDERR")
-    ASSESSMENT_EXIT_CODE=$?
+    ASSESSMENT_OUTPUT=$(echo "$ASSESSMENT_PROMPT" | claude $CLAUDE_ARGS 2>"$CLAUDE_STDERR" | tee /dev/stderr)
+    ASSESSMENT_EXIT_CODE=${PIPESTATUS[0]}
   fi
 
   CLAUDE_ERROR=$(cat "$CLAUDE_STDERR")
@@ -354,9 +533,16 @@ else
   print_info "You can review and approve Claude's assessment decisions"
   echo ""
 
+  # Build Claude args with model flag for consistency
+  # Note: Using --print because stdin piping breaks interactive TTY
+  CLAUDE_ARGS_SUPERVISED="--print"
+  if [ -n "$EFFECTIVE_MODEL" ]; then
+    CLAUDE_ARGS_SUPERVISED="$CLAUDE_ARGS_SUPERVISED --model $EFFECTIVE_MODEL"
+  fi
+
   CLAUDE_STDERR=$(mktemp)
-  ASSESSMENT_OUTPUT=$(echo "$ASSESSMENT_PROMPT" | claude 2>"$CLAUDE_STDERR")
-  ASSESSMENT_EXIT_CODE=$?
+  ASSESSMENT_OUTPUT=$(echo "$ASSESSMENT_PROMPT" | claude $CLAUDE_ARGS_SUPERVISED 2>"$CLAUDE_STDERR" | tee /dev/stderr)
+  ASSESSMENT_EXIT_CODE=${PIPESTATUS[0]}
   CLAUDE_ERROR=$(cat "$CLAUDE_STDERR")
   rm -f "$CLAUDE_STDERR"
 
@@ -427,6 +613,9 @@ if [[ "$ASSESSMENT_OUTPUT" == "ERROR:"* ]] || [ -z "$ASSESSMENT_OUTPUT" ]; then
 fi
 
 print_success "Assessment complete"
+
+# Cache successful result for future determinism
+save_to_cache "$CACHE_KEY" "$ASSESSMENT_OUTPUT" "$EFFECTIVE_MODEL"
 
 # Parse assessment to check for actionable items (NOW or LATER)
 ACTIONABLE_NOW_ITEMS=$(echo "$ASSESSMENT_OUTPUT" | grep "ACTIONABLE_NOW" || echo "")

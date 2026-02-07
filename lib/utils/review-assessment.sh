@@ -34,8 +34,9 @@ assess_pr_review() {
   echo ""
 
   # Get the LATEST review only (use jq array indexing, not tail)
+  # Includes bot accounts AND local reviews (marked with sharkrite-local-review)
   local LATEST_REVIEW=$(gh pr view "$PR_NUMBER" --json comments \
-    --jq '[.comments[] | select(.author.login == "claude" or .author.login == "claude-code" or .author.login == "github-actions[bot]")] | .[-1] | .body' \
+    --jq '[.comments[] | select(.author.login == "claude" or .author.login == "claude-code" or .author.login == "github-actions[bot]" or (.body | contains("<!-- sharkrite-local-review -->")))] | .[-1] | .body' \
     2>/dev/null)
 
   # Validate gh CLI returned valid data
@@ -45,7 +46,8 @@ assess_pr_review() {
   fi
 
   # Validate this is actually a code review (not arbitrary bot comment)
-  if ! echo "$LATEST_REVIEW" | grep -qiE "##? Code Review|##+ Overview"; then
+  # Accept: section markers OR sharkrite local review marker
+  if ! echo "$LATEST_REVIEW" | grep -qiE "##? Code Review|##+ Overview|sharkrite-local-review"; then
     echo "⚠️  Comment found but doesn't appear to be a code review"
     echo "   (Missing 'Code Review' or 'Overview' section markers)"
     return 3  # Exit code 3: invalid format

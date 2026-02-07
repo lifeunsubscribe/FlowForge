@@ -126,10 +126,10 @@ clear_current_work() {
   if [[ "$OSTYPE" == "darwin"* ]]; then
     sed -i '' '/## Current Work/a\
 \
-_No active work — run `forge <issue>` to start_\
+_No active work — run `rite <issue>` to start_\
 ' "$temp_file"
   else
-    sed -i '/## Current Work/a\\n_No active work — run `forge <issue>` to start_\n' "$temp_file"
+    sed -i '/## Current Work/a\\n_No active work — run `rite <issue>` to start_\n' "$temp_file"
   fi
 
   mv "$temp_file" "$SCRATCHPAD_FILE"
@@ -155,7 +155,7 @@ init_scratchpad() {
 
 ## Current Work
 
-_No active work — run `forge <issue>` to start_
+_No active work — run `rite <issue>` to start_
 
 ---
 

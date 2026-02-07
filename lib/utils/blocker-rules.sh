@@ -19,7 +19,8 @@ detect_infrastructure_changes() {
 
   if [ -n "$infra_files" ]; then
     echo "BLOCKER: Infrastructure changes detected"
-    echo "Files: $(echo "$infra_files" | tr '\n' ', ')"
+    echo "Files:"
+    echo "$infra_files" | sed 's/^/  /'
     return 1
   fi
 
@@ -35,7 +36,8 @@ detect_database_migrations() {
 
   if [ -n "$migration_files" ]; then
     echo "BLOCKER: Database migration detected"
-    echo "Migrations: $(echo "$migration_files" | tr '\n' ', ')"
+    echo "Migrations:"
+    echo "$migration_files" | sed 's/^/  /'
 
     # Show migration SQL if available
     echo ""
@@ -57,10 +59,13 @@ detect_auth_changes() {
 
   if [ -n "$auth_files" ]; then
     echo "BLOCKER: Authentication/authorization code changes detected"
-    echo "Files: $(echo "$auth_files" | tr '\n' ', ')"
+    echo "Files:"
+    echo "$auth_files" | sed 's/^/  /'
     echo ""
     echo "Auth changes require extra security review"
-    echo "Tip: Run in supervised mode (forge <issue> --supervised) to review and approve manually"
+    if [ "${WORKFLOW_MODE:-}" != "supervised" ]; then
+      echo "Tip: Run in supervised mode (rite <issue> --supervised) to review and approve manually"
+    fi
     return 1
   fi
 
@@ -76,10 +81,13 @@ detect_doc_changes() {
 
   if [ -n "$doc_files" ]; then
     echo "BLOCKER: Architectural documentation changes detected"
-    echo "Docs: $(echo "$doc_files" | tr '\n' ', ')"
+    echo "Docs:"
+    echo "$doc_files" | sed 's/^/  /'
     echo ""
     echo "Architecture changes may require manual review"
-    echo "Tip: Run in supervised mode (forge <issue> --supervised) to review and approve manually"
+    if [ "${WORKFLOW_MODE:-}" != "supervised" ]; then
+      echo "Tip: Run in supervised mode (rite <issue> --supervised) to review and approve manually"
+    fi
     return 1
   fi
 
@@ -194,7 +202,9 @@ detect_protected_scripts() {
       echo "BLOCKER: Protected script changed: $script"
       echo ""
       echo "Changes to workflow automation scripts require manual review"
-      echo "Tip: Run in supervised mode (--supervised) to review and approve merge manually"
+      if [ "${WORKFLOW_MODE:-}" != "supervised" ]; then
+        echo "Tip: Run in supervised mode (--supervised) to review and approve merge manually"
+      fi
       echo ""
       echo "Diff:"
       gh pr diff "$pr_number" -- "*/$script" 2>/dev/null | head -100

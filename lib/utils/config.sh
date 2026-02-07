@@ -95,6 +95,19 @@ RITE_CLAUDE_TIMEOUT="${RITE_CLAUDE_TIMEOUT:-7200}"
 # Claude Code model (empty = use Claude Code default, e.g. "opus", "sonnet", "haiku")
 RITE_CLAUDE_MODEL="${RITE_CLAUDE_MODEL:-}"
 
+# Model for reviews and assessments (default: opus for quality)
+# Review and assessment MUST use same model for consistency
+RITE_REVIEW_MODEL="${RITE_REVIEW_MODEL:-opus}"
+
+# Assessment cache directory (stores cached assessments by review hash)
+RITE_ASSESSMENT_CACHE_DIR="${RITE_ASSESSMENT_CACHE_DIR:-$RITE_DATA_DIR/assessment-cache}"
+
+# Review method: "app" | "local" | "auto" (default: auto)
+#   - "app": Use Claude for GitHub app only (fail if not installed)
+#   - "local": Use local Claude Code review only (never wait for app)
+#   - "auto": Try app first, fallback to local if not available or stale
+RITE_REVIEW_METHOD="${RITE_REVIEW_METHOD:-auto}"
+
 # Dry-run mode
 RITE_DRY_RUN="${RITE_DRY_RUN:-false}"
 
@@ -126,7 +139,7 @@ RITE_BLOCKERS_CONFIG="$RITE_PROJECT_ROOT/$RITE_DATA_DIR/blockers.conf"
 safe_source "$RITE_BLOCKERS_CONFIG"
 
 # Blocker pattern defaults (if not set by project config)
-BLOCKER_INFRASTRUCTURE_PATHS="${BLOCKER_INFRASTRUCTURE_PATHS:-infrastructure/|cdk/|terraform/|cloudformation/}"
+BLOCKER_INFRASTRUCTURE_PATHS="${BLOCKER_INFRASTRUCTURE_PATHS:-infrastructure/|cdk/|terraform/|cloudformation/|\.github/workflows/|\.claude/}"
 BLOCKER_MIGRATION_PATHS="${BLOCKER_MIGRATION_PATHS:-prisma/migrations/|migrations/|db/migrate/|alembic/}"
 BLOCKER_AUTH_PATHS="${BLOCKER_AUTH_PATHS:-auth/|Auth|authentication|authorization|cognito|oauth}"
 BLOCKER_DOC_PATHS="${BLOCKER_DOC_PATHS:-Technical-Specs|Architecture|CLAUDE.md|ARCHITECTURE.md}"
@@ -158,6 +171,9 @@ export SCRATCHPAD_FILE
 export SESSION_STATE_FILE
 export RITE_CLAUDE_TIMEOUT
 export RITE_CLAUDE_MODEL
+export RITE_REVIEW_MODEL
+export RITE_ASSESSMENT_CACHE_DIR
+export RITE_REVIEW_METHOD
 export RITE_DRY_RUN
 export SKIP_AWS_CHECK
 export BLOCKER_INFRASTRUCTURE_PATHS
@@ -173,6 +189,7 @@ export BLOCKER_EXPENSIVE_SERVICES
 
 if [ "$RITE_DRY_RUN" != "true" ]; then
   mkdir -p "$RITE_PROJECT_ROOT/$RITE_DATA_DIR"
+  mkdir -p "$RITE_PROJECT_ROOT/$RITE_ASSESSMENT_CACHE_DIR"
   mkdir -p "$RITE_WORKTREE_DIR"
 
   # Create .rite/.gitignore if it doesn't exist

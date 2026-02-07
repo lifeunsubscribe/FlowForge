@@ -107,7 +107,7 @@ while [[ $# -gt 0 ]]; do
       echo "  rite 21 --bypass-blockers # Unsupervised: bypass blockers, warn via Slack"
       echo "  rite 21 45                # Batch process issues"
       echo "  rite 21 --quick           # Quick mode: work + PR only"
-      echo "  rite --followup           # Process security-debt issues"
+      echo "  rite --followup           # Process tech-debt issues"
       echo "  rite 21 --dry-run         # See what would happen"
       echo ""
       echo "Sharkrite - Master your workflows."
