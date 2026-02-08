@@ -546,7 +546,7 @@ echo ""
 # This runs BEFORE displaying summary so counts are accurate
 # ============================================================================
 
-print_header "🤖 Smart Assessment (Claude CLI)"
+print_header "🦈 Smart Assessment (Sharkrite)"
 
 ACTIONABLE_COUNT=0
 
@@ -869,7 +869,7 @@ $(echo "$FILTERED_CONTENT" | grep -B2 -A 20 "ACTIONABLE_NOW" | grep -B2 -A 20 "L
     else
       ASSESSMENT_NOTE="
 
-> 🤖 **Smart Assessment Applied**: Issues below have been filtered by Claude Code's three-state categorization. Only items deemed **ACTIONABLE** are included (either NOW or LATER). Opinionated style preferences have been dismissed."
+> 🦈 **Smart Assessment Applied**: Issues below have been filtered by Sharkrite's three-state categorization. Only items deemed **ACTIONABLE** are included (either NOW or LATER). Opinionated style preferences have been dismissed."
     fi
   fi
 

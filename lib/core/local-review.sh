@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # lib/core/local-review.sh
-# Run a local Claude Code review and post it as a PR comment
+# Run a local Sharkrite review and post it as a PR comment
 #
 # Usage:
 #   local-review.sh <PR_NUMBER> [--post] [--auto]
@@ -9,7 +9,7 @@
 #   --post    Post the review as a PR comment (default: preview only)
 #   --auto    Use --dangerously-skip-permissions for automation
 #
-# This replaces Claude for GitHub's auto-review with a local Claude Code session.
+# This replaces Claude for GitHub's auto-review with a local Sharkrite session.
 # Benefits:
 #   - No dependency on external service
 #   - Faster (no webhook latency)
@@ -89,7 +89,7 @@ if [[ ! $PR_NUMBER =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
-print_header "Local Claude Code Review - PR #$PR_NUMBER"
+print_header "🦈 Sharkrite Code Review - PR #$PR_NUMBER"
 echo ""
 
 # Get PR info
@@ -228,7 +228,7 @@ else
   ESTIMATE="2-4 minutes"
 fi
 
-print_info "Running Claude Code review (estimated: $ESTIMATE)..."
+print_info "Running Sharkrite review (estimated: $ESTIMATE)..."
 echo ""
 
 # Run Claude to generate the review

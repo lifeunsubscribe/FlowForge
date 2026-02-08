@@ -239,7 +239,7 @@ $(echo "$COMMIT_SUMMARY" | sed 's/^/- /')
 - [x] Code builds successfully
 - [x] Unit tests pass locally
 - [ ] Integration tests pass (CI will verify)
-- [ ] Claude Code review pending
+- [ ] Sharkrite code review pending
 
 ## Security Checklist
 
@@ -409,7 +409,7 @@ REVIEW_METHOD="${RITE_REVIEW_METHOD:-auto}"
 if ! should_wait_for_app_review; then
   # Config says use local, or auto mode with no app detected
   if [ "$REVIEW_METHOD" = "local" ]; then
-    print_info "Review method: Local Claude Code"
+    print_info "Review method: Local Sharkrite"
     print_info "   Reason: RITE_REVIEW_METHOD=local (config preference)"
     print_info "Triggering local review immediately..."
     echo ""
@@ -431,7 +431,7 @@ if ! should_wait_for_app_review; then
     exit 0
   else
     # Auto mode, no app detected - this is fallback
-    print_warning "Review method: Local Claude Code (fallback)"
+    print_warning "Review method: Local Sharkrite (fallback)"
     print_info "   Reason: RITE_REVIEW_METHOD=auto (fallback: no GitHub app detected)"
     print_info "Triggering local review..."
     echo ""
@@ -469,7 +469,7 @@ trap 'echo ""; print_warning "Review wait interrupted by user (Ctrl-C)"; exit 13
 
 # Now wait for automated review
 if [ "$AUTO_MODE" = false ]; then
-  print_header "⏳ Waiting for Automated Claude Code Review"
+  print_header "⏳ Waiting for Automated Sharkrite Review"
 fi
 
 # Dynamic wait time based on PR complexity
@@ -519,7 +519,7 @@ fi
 
 # Only wait if no review exists yet
 if [ "$PR_READY" != true ]; then
-  print_info "Waiting for Claude Code review comment on PR #$PR_NUMBER..."
+  print_info "Waiting for Sharkrite review comment on PR #$PR_NUMBER..."
   echo "  Checking for comments from: claude, claude-code, github-actions[bot]"
   echo "  Looking for: comment posted AFTER latest commit"
   echo ""
@@ -558,7 +558,7 @@ while [ "$PR_READY" != true ] && [ $ELAPSED -lt $MAX_TOTAL_WAIT ]; do
   LATEST_COMMIT_TIME=$(gh pr view $PR_NUMBER --json commits \
     --jq '.commits[-1].committedDate' 2>/dev/null)
 
-  # Check for Claude Code review comments with timestamp (bot accounts OR local reviews)
+  # Check for Sharkrite review comments with timestamp (bot accounts OR local reviews)
   REVIEW_DATA=$(gh pr view $PR_NUMBER --json comments \
     --jq '[.comments[] | select(.author.login == "claude" or .author.login == "claude-code" or .author.login == "github-actions[bot]" or (.body | contains("<!-- sharkrite-local-review -->")))] | .[-1] | {body: .body, createdAt: .createdAt, author: .author.login}' \
     2>/dev/null)

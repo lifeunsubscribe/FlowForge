@@ -190,10 +190,10 @@ update_security_guide_from_pr() {
   print_warning "Security findings detected in PR #$pr_number"
   print_info "Analyzing findings against existing security guide..."
 
-  # Use Claude Code to analyze and update guide
+  # Use Sharkrite to analyze and update guide
   CLAUDE_CMD="claude"
   if ! command -v "$CLAUDE_CMD" &> /dev/null; then
-    print_warning "Claude Code CLI not found, skipping auto-update"
+    print_warning "Sharkrite CLI not found, skipping auto-update"
     return 0
   fi
 
@@ -262,7 +262,7 @@ ANALYSIS_EOF
 
   print_success "Security guide analysis complete"
 
-  # Apply updates using Claude Code
+  # Apply updates using Sharkrite
   print_info "Applying updates to security guide..."
 
   # Use temp files to avoid command injection
@@ -493,8 +493,8 @@ else
   print_warning "No reviews yet"
 fi
 
-# Check 6: Claude Code review
-print_info "Checking for Claude Code review..."
+# Check 6: Sharkrite code review
+print_info "Checking for Sharkrite review..."
 CLAUDE_REVIEW_FOUND=false
 
 # Get latest comment from Claude user (more robust than pattern matching)
@@ -524,13 +524,13 @@ if [ -n "$LATEST_CLAUDE_REVIEW" ]; then
   fi
 
   if [ "$CRITICAL_COUNT" -gt 0 ]; then
-    print_error "Claude Code found $CRITICAL_COUNT CRITICAL issue(s) that must be addressed"
+    print_error "Sharkrite found $CRITICAL_COUNT CRITICAL issue(s) that must be addressed"
     VALIDATION_FAILED=true
   else
-    print_success "Claude Code review passed (CRITICAL: 0)"
+    print_success "Sharkrite review passed (CRITICAL: 0)"
   fi
 else
-  print_warning "No Claude Code review found yet"
+  print_warning "No Sharkrite review found yet"
 fi
 
 # Analyze HIGH and MEDIUM issues if review exists
@@ -556,7 +556,7 @@ if [ "$CLAUDE_REVIEW_FOUND" = true ] && [ "$CRITICAL_COUNT" -eq 0 ]; then
     echo "$LATEST_CLAUDE_REVIEW" > "$REVIEW_FILE"
 
     # Create analysis prompt
-    ANALYSIS_PROMPT="Review the following Claude Code review findings and provide a brief assessment for each HIGH and MEDIUM issue:
+    ANALYSIS_PROMPT="Review the following Sharkrite review findings and provide a brief assessment for each HIGH and MEDIUM issue:
 
 For each issue, provide:
 1. **Issue Name** (one line summary)
@@ -1109,7 +1109,7 @@ EOF
             }
 
             # Keep header and HIGH PRIORITY as-is (user manages this manually)
-            /^# Claude Code Scratchpad/,/^## 🔥 HIGH PRIORITY/ { print; next }
+            /^# Sharkrite Scratchpad/,/^## 🔥 HIGH PRIORITY/ { print; next }
             /^## 🔥 HIGH PRIORITY/,/^##/ {
               if (/^##/ && !/^## 🔥 HIGH PRIORITY/) {
                 # End of HIGH PRIORITY section

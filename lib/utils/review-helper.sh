@@ -4,7 +4,7 @@
 #
 # Config: RITE_REVIEW_METHOD = "app" | "local" | "auto" (default: auto)
 #   - "app": Use Claude for GitHub app only (fail if not installed)
-#   - "local": Use local Claude Code review only (never wait for app)
+#   - "local": Use local Sharkrite review only (never wait for app)
 #   - "auto": Try app first, fallback to local if not available or stale
 #
 # Usage:
@@ -39,9 +39,9 @@ _log_review_method() {
       ;;
     local)
       if [ "$is_fallback" = "true" ]; then
-        echo -e "${YELLOW}ℹ️  Review method: Local Claude Code (fallback)${NC}"
+        echo -e "${YELLOW}ℹ️  Review method: Local Sharkrite (fallback)${NC}"
       else
-        echo -e "${BLUE}ℹ️  Review method: Local Claude Code${NC}"
+        echo -e "${BLUE}ℹ️  Review method: Local Sharkrite${NC}"
       fi
       ;;
     *)
@@ -73,7 +73,7 @@ check_review_app_available() {
 }
 
 # =============================================================================
-# Trigger a local Claude Code review
+# Trigger a local Sharkrite review
 # Usage: trigger_local_review <pr_number> [--auto]
 # Returns: 0 = success, 1 = failure
 # =============================================================================
@@ -96,7 +96,7 @@ trigger_local_review() {
     return 1
   fi
 
-  _log_review_method "local" "Generating review with local Claude Code"
+  _log_review_method "local" "Generating review with local Sharkrite"
 
   if [ "$auto_mode" = true ]; then
     "$local_review_script" "$pr_number" --post --auto 2>&1

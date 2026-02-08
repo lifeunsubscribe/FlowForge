@@ -89,7 +89,7 @@ SCRATCHPAD_FILE="${SCRATCHPAD_FILE:-$RITE_PROJECT_ROOT/$RITE_DATA_DIR/scratch.md
 # Session state
 SESSION_STATE_FILE="${SESSION_STATE_FILE:-/tmp/rite-session-state-${RITE_PROJECT_NAME}.json}"
 
-# Claude Code timeout (seconds, default 2 hours)
+# Sharkrite timeout (seconds, default 2 hours)
 RITE_CLAUDE_TIMEOUT="${RITE_CLAUDE_TIMEOUT:-7200}"
 
 # Claude model (empty = use default, e.g. "opus", "sonnet", "haiku")
@@ -104,7 +104,7 @@ RITE_ASSESSMENT_CACHE_DIR="${RITE_ASSESSMENT_CACHE_DIR:-$RITE_DATA_DIR/assessmen
 
 # Review method: "app" | "local" | "auto" (default: local)
 #   - "app": Use Claude for GitHub app only (fail if not installed)
-#   - "local": Use local Claude Code review only (never wait for app)
+#   - "local": Use local Sharkrite review only (never wait for app)
 #   - "auto": Try app first, fallback to local if not available or stale
 RITE_REVIEW_METHOD="${RITE_REVIEW_METHOD:-local}"
 

@@ -258,9 +258,9 @@ else
     # Initialize scratchpad with basic structure
     mkdir -p "$(dirname "$SCRATCHPAD_FILE")"
     cat > "$SCRATCHPAD_FILE" <<'EOF'
-# Claude Code Scratchpad
+# Sharkrite Scratchpad
 
-**Purpose:** Working notes, security findings, and development context for Claude Code
+**Purpose:** Working notes, security findings, and development context for Sharkrite
 
 ---
 
@@ -358,7 +358,7 @@ WORKFLOW_FILE="$RITE_PROJECT_ROOT/.github/workflows/claude-code-review.yml"
 INSTRUCTIONS_FILE="$RITE_PROJECT_ROOT/.github/claude-code/pr-review-instructions.md"
 
 if [ -f "$WORKFLOW_FILE" ]; then
-  print_success "Claude Code review workflow found"
+  print_success "Sharkrite review workflow found"
 
   # Check permissions
   if grep -q "pull-requests: write" "$WORKFLOW_FILE"; then
@@ -393,7 +393,7 @@ if [ -f "$WORKFLOW_FILE" ]; then
   fi
 
 else
-  print_warning "No Claude Code review workflow found"
+  print_warning "No Sharkrite review workflow found"
   print_info "Run 'rite --init' to create one"
 fi
 echo ""

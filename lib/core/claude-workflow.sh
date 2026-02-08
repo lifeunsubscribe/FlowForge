@@ -30,7 +30,7 @@ source "$RITE_LIB_DIR/utils/session-tracker.sh"
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
 # Early output to confirm script is running
-echo "🚀 Claude Workflow Starting..."
+echo "🦈 Sharkrite Workflow Starting..."
 echo ""
 
 # Trap handler for safe exit on interrupt
@@ -315,7 +315,7 @@ The workflow will automatically commit, push, and request a new review.
 
 $EXIT_INSTRUCTION"
 
-  print_info "Invoking Claude Code to fix review issues..."
+  print_info "Invoking Sharkrite to fix review issues..."
   echo ""
 
   # Run Claude Code with the fix prompt
@@ -1048,11 +1048,11 @@ echo ""
 if [ "$UNCOMMITTED_CHANGES" -gt 0 ]; then
   print_info "Found $UNCOMMITTED_CHANGES uncommitted changes"
   echo ""
-  print_info "Work appears to be in progress - skipping Claude Code session"
+  print_info "Work appears to be in progress - skipping Sharkrite session"
   print_info "Will proceed directly to commit/PR workflow"
   echo ""
 
-  # Set flag to skip Claude Code
+  # Set flag to skip Sharkrite session
   SKIP_CLAUDE=true
 else
   print_success "No uncommitted changes (untracked files will be ignored)"
@@ -1117,8 +1117,11 @@ _Draft PR created automatically by rite for tracking purposes._"
 fi
 
 # Build Claude Code prompt
-print_header "🤖 Starting Claude Code Session"
+print_header "🦈 Starting Sharkrite Session"
 
+# Show model info
+EFFECTIVE_MODEL="${RITE_CLAUDE_MODEL:-opus}"
+echo "⚡ Powered by Claude ($EFFECTIVE_MODEL)"
 echo ""
 
 # Show workflow summary
@@ -1291,7 +1294,7 @@ ${AUTO_MODE_FINAL_NOTE}
 
 Ready to start? Begin with Phase 0: Requirements Clarification."
 
-echo "Starting Claude Code with task:"
+echo "Starting Sharkrite with task:"
 echo "\"$ISSUE_DESC\""
 echo ""
 
@@ -1303,17 +1306,17 @@ fi
 
 # Run Claude Code (unless skipped)
 if [ "$SKIP_CLAUDE" = true ]; then
-  print_info "Skipping Claude Code session (work already in progress)"
+  print_info "Skipping Sharkrite session (work already in progress)"
   print_info "Proceeding to post-workflow"
   echo ""
 elif [ "$ALREADY_IN_CLAUDE" = true ]; then
-  print_warning "Already running inside Claude Code - skipping recursive invocation"
-  print_info "Claude Code work complete - proceeding to post-workflow"
+  print_warning "Already running inside Sharkrite - skipping recursive invocation"
+  print_info "Sharkrite work complete - proceeding to post-workflow"
   echo ""
 else
   # Set timeout for Claude Code (configurable via RITE_CLAUDE_TIMEOUT, default 2 hours)
   CLAUDE_TIMEOUT=${RITE_CLAUDE_TIMEOUT:-7200}
-  print_info "Launching Claude Code (timeout: ${CLAUDE_TIMEOUT}s)..."
+  print_info "Launching Sharkrite (timeout: ${CLAUDE_TIMEOUT}s)..."
 
   # Detect timeout command (gtimeout on macOS via coreutils, timeout on Linux)
   if command -v gtimeout >/dev/null 2>&1; then
@@ -1350,7 +1353,7 @@ else
   # Handle exit codes
   if [ $CLAUDE_EXIT_CODE -eq 124 ]; then
     # Timeout
-    print_error "Claude Code timed out after ${CLAUDE_TIMEOUT}s"
+    print_error "Sharkrite timed out after ${CLAUDE_TIMEOUT}s"
     print_info "Checking for uncommitted work..."
 
     if [ "$(git status --porcelain | wc -l | tr -d ' ')" -gt 0 ]; then
@@ -1368,7 +1371,7 @@ else
     print_info "Check that 'gtimeout' is installed on macOS: brew install coreutils"
     exit 127
   elif [ $CLAUDE_EXIT_CODE -ne 0 ]; then
-    print_error "Claude Code exited with error code $CLAUDE_EXIT_CODE"
+    print_error "Sharkrite exited with error code $CLAUDE_EXIT_CODE"
     print_info "Checking for uncommitted work..."
 
     if [ "$(git status --porcelain | wc -l | tr -d ' ')" -gt 0 ]; then
@@ -1387,7 +1390,7 @@ if [ "${SKIP_TO_PR:-false}" = true ]; then
 else
   if [ "$AUTO_MODE" = false ]; then
     print_header "📝 Post-Implementation Workflow"
-    echo "Claude Code session complete. Let's review what changed."
+    echo "Sharkrite session complete. Let's review what changed."
     echo ""
   fi
 
@@ -1411,7 +1414,7 @@ if [ $CHANGES_COUNT -eq 0 ]; then
     print_info "The workflow will exit without creating a PR."
     print_info "This can happen if:"
     echo "  • The task was already complete"
-    echo "  • Claude Code determined no changes were needed"
+    echo "  • Sharkrite determined no changes were needed"
     echo "  • The session timed out before making changes"
     echo ""
 

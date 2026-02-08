@@ -372,7 +372,7 @@ phase_pre_start_checks() {
 phase_claude_workflow() {
   local issue_number="$1"
 
-  print_header "Phase 1: Claude Workflow (Development)"
+  print_header "Phase 1: Sharkrite Workflow (Development)"
 
   set_current_issue "$issue_number"
 
@@ -730,7 +730,7 @@ phase_assess_and_resolve() {
 
   if [ $assessment_result -eq 2 ]; then
     # Critical issues found - need to fix and restart PR cycle
-    print_warning "Critical issues found - invoking Claude to fix"
+    print_warning "Critical issues found - invoking Sharkrite to fix"
 
     if [ $now_count -gt 0 ] || [ $later_count -gt 0 ] || [ $dismissed_count -gt 0 ]; then
       print_info "Decision breakdown:"
@@ -1067,7 +1067,7 @@ EOF
         ;;
       claude-workflow|phase-1)
         skip_to_phase="claude-workflow"
-        print_info "Resuming from phase 1 (Claude workflow)"
+        print_info "Resuming from phase 1 (Sharkrite workflow)"
         ;;
       create-pr|phase-2)
         skip_to_phase="create-pr"
