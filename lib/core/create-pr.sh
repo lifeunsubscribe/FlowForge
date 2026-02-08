@@ -310,7 +310,7 @@ fi
 
 # Early blocker detection: Check for file-based blockers BEFORE waiting for review
 # This prevents wasting time waiting for a review that will be blocked anyway
-print_info "Running pre-review blocker checks..."
+echo "Running pre-review blocker checks..."
 
 # Check for various file-based blockers
 # Temporarily disable exit-on-error so blocker check failures don't crash the script
@@ -376,18 +376,9 @@ fi
 set -e  # Re-enable exit-on-error
 
 if [ "$blocker_detected" = true ]; then
-  print_warning "Blocker detected: $blocker_type"
-  echo ""
-  echo "$blocker_details"
-  echo ""
-  print_info "This PR requires manual review before proceeding"
-  if [ "$AUTO_MODE" = true ]; then
-    print_info "Run in supervised mode to review and approve: rite <issue> --supervised"
-  fi
-  echo ""
-
-  # Write blocker details to file for workflow-runner to read
+  # Write blocker details to file for workflow-runner to read and display
   # (exports don't persist across process boundaries)
+  # workflow-runner's handle_blocker will show the full details
   mkdir -p "${RITE_PROJECT_ROOT:-.}/.rite"
   cat > "${RITE_PROJECT_ROOT:-.}/.rite/early-blocker.env" <<EOF
 BLOCKER_TYPE="$blocker_type"

@@ -42,6 +42,12 @@ cleanup_pr_cache() {
     ((removed++)) || true
   done < <(find "$cache_dir" -name "*.meta" -exec grep -l "\"pr_number\": \"$pr_num\"" {} \; 2>/dev/null)
 
+  # Also clean up the "previous assessment" file used for cross-iteration determinism
+  if [ -f "$cache_dir/pr-${pr_num}-previous.json" ]; then
+    rm -f "$cache_dir/pr-${pr_num}-previous.json" "$cache_dir/pr-${pr_num}-previous.meta" 2>/dev/null
+    ((removed++)) || true
+  fi
+
   if [ "$removed" -gt 0 ]; then
     print_info "Cleaned $removed cached assessments for merged PR #$pr_num"
   fi

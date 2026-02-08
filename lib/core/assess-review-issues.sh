@@ -77,6 +77,84 @@ EOF
 }
 
 # =============================================================================
+# CROSS-ITERATION DETERMINISM: Preserve classifications from previous assessments
+# =============================================================================
+# When a new review is generated after fixes, we want items that appeared in
+# both the old and new reviews to retain their classification from the first
+# assessment. This prevents flip-flopping between ACTIONABLE_NOW and ACTIONABLE_LATER.
+
+get_previous_assessment() {
+  local pr_number="$1"
+  local cache_dir="$RITE_PROJECT_ROOT/$RITE_ASSESSMENT_CACHE_DIR"
+
+  # First, check for the dedicated "previous assessment" file (most reliable)
+  local previous_file="$cache_dir/pr-${pr_number}-previous.json"
+  if [ -f "$previous_file" ]; then
+    cat "$previous_file"
+    return 0
+  fi
+
+  # Fallback: Find most recent assessment for this PR by scanning meta files
+  # (This handles cases where there's cached data but no dedicated previous file)
+  local latest_meta=""
+  local latest_time=0
+
+  if [ -d "$cache_dir" ]; then
+    while IFS= read -r meta_file; do
+      [ -z "$meta_file" ] && continue
+      local meta_pr=$(grep -o '"pr_number": "[0-9]*"' "$meta_file" 2>/dev/null | grep -o '[0-9]*' || echo "")
+      if [ "$meta_pr" = "$pr_number" ]; then
+        # Get creation timestamp
+        local created=$(grep -o '"created": "[^"]*"' "$meta_file" 2>/dev/null | cut -d'"' -f4 || echo "")
+        if [ -n "$created" ]; then
+          # Convert to epoch for comparison (portable)
+          local epoch=0
+          if date --version >/dev/null 2>&1; then
+            epoch=$(date -d "$created" +%s 2>/dev/null || echo "0")
+          else
+            epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$created" +%s 2>/dev/null || echo "0")
+          fi
+          if [ "$epoch" -gt "$latest_time" ]; then
+            latest_time=$epoch
+            latest_meta="$meta_file"
+          fi
+        fi
+      fi
+    done < <(find "$cache_dir" -name "*.meta" 2>/dev/null)
+  fi
+
+  if [ -n "$latest_meta" ]; then
+    local assessment_file="${latest_meta%.meta}.json"
+    if [ -f "$assessment_file" ]; then
+      cat "$assessment_file"
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+save_as_previous_assessment() {
+  local pr_number="$1"
+  local assessment="$2"
+  local cache_dir="$RITE_PROJECT_ROOT/$RITE_ASSESSMENT_CACHE_DIR"
+
+  mkdir -p "$cache_dir"
+
+  # Save as the "previous" assessment for this PR (used for cross-iteration determinism)
+  # This is separate from the content-hash cache - it's the PR's "last known" assessment
+  echo "$assessment" > "$cache_dir/pr-${pr_number}-previous.json"
+
+  cat > "$cache_dir/pr-${pr_number}-previous.meta" << EOF
+{
+  "created": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "pr_number": "$pr_number",
+  "type": "previous_assessment"
+}
+EOF
+}
+
+# =============================================================================
 # JSON SCHEMA: Structured output schema for deterministic parsing (internal)
 # =============================================================================
 # NOTE: This schema is defined for future use with Claude CLI's --output-format json
@@ -224,6 +302,42 @@ detect_claude_error() {
 # Export detected error for use by workflow-runner
 export CLAUDE_ERROR_TYPE=""
 
+# =============================================================================
+# CROSS-ITERATION DETERMINISM: Load previous assessment BEFORE building prompt
+# =============================================================================
+# If there's a previous assessment from an earlier iteration, we include it
+# so Claude can defer to previous classifications for items that appear in both.
+
+PREVIOUS_ASSESSMENT=""
+PREVIOUS_ASSESSMENT_SECTION=""
+
+if PREVIOUS_ASSESSMENT=$(get_previous_assessment "$PR_NUMBER" 2>/dev/null); then
+  print_info "Found previous assessment for PR #$PR_NUMBER - will use for determinism" >&2
+
+  PREVIOUS_ASSESSMENT_SECTION="
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PREVIOUS ASSESSMENT (from earlier iteration):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+IMPORTANT: For items that appeared in the previous assessment and still appear
+in this review, you MUST preserve the previous classification. This ensures
+determinism across review iterations.
+
+Rules for cross-iteration consistency:
+1. If an item was ACTIONABLE_LATER before → keep it ACTIONABLE_LATER
+2. If an item was DISMISSED before → keep it DISMISSED
+3. Only items that are NEW (not in previous assessment) should be freshly classified
+4. Use title/description matching to identify same items across iterations
+
+Previous classifications:
+$PREVIOUS_ASSESSMENT
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"
+else
+  print_info "No previous assessment found - this is the first assessment for PR #$PR_NUMBER" >&2
+fi
+
 # Create assessment prompt for Claude
 ASSESSMENT_PROMPT="You are assessing a code review.
 
@@ -243,7 +357,7 @@ Rules:
     * ACTIONABLE_LATER over DISMISSED
 - Apply the same reasoning pattern to similar issues
 - Do NOT introduce randomness in your decision-making
-
+$PREVIOUS_ASSESSMENT_SECTION
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ORIGINAL ISSUE SCOPE:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -290,6 +404,8 @@ ACTIONABLE_LATER - Valid concern, create follow-up issue:
   - Issues OUTSIDE the original issue scope (scope creep)
   - Large refactors requiring architectural changes (>1 hour)
   - Changes that touch unrelated code/systems
+  - Breaking changes affecting existing users (e.g., API changes, validation rule changes)
+  - Multi-file changes that would warrant their own PR review cycle
   - Improvements that need their own focused PR
   - Test coverage gaps in code NOT directly related to the issue
 
@@ -346,6 +462,8 @@ ACTIONABLE_LATER (defer to tech-debt) IF:
   - Valid concern but OUTSIDE original issue scope
   - Large refactor requiring >1 hour of work
   - Touches unrelated code or systems
+  - Breaking changes that affect existing users or APIs
+  - Multi-file changes spanning unrelated modules (warrant own PR cycle)
   - Requires design discussion or new dependencies
   - Would need its own test suite or documentation update
 
@@ -555,6 +673,10 @@ print_success "Assessment complete"
 
 # Cache successful result for future determinism
 save_to_cache "$CACHE_KEY" "$ASSESSMENT_OUTPUT" "$EFFECTIVE_MODEL"
+
+# Also save as "previous" assessment for cross-iteration determinism
+# This ensures the next iteration (after fixes) can defer to these classifications
+save_as_previous_assessment "$PR_NUMBER" "$ASSESSMENT_OUTPUT"
 
 # Parse assessment to check for actionable items (NOW or LATER)
 ACTIONABLE_NOW_ITEMS=$(echo "$ASSESSMENT_OUTPUT" | grep "ACTIONABLE_NOW" || echo "")

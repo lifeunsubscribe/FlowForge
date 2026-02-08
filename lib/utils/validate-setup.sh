@@ -99,6 +99,24 @@ else
 fi
 echo ""
 
+# Check 4b: GNU coreutils (for timeout on macOS)
+print_info "Checking GNU coreutils..."
+if command -v gtimeout &>/dev/null; then
+  print_success "GNU coreutils installed (gtimeout available)"
+elif command -v timeout &>/dev/null; then
+  # Check if it's GNU timeout (Linux) or BSD timeout
+  if timeout --version 2>/dev/null | grep -q "GNU"; then
+    print_success "GNU timeout available"
+  else
+    print_warning "BSD timeout found (may not support all features)"
+    print_info "Install GNU coreutils: brew install coreutils"
+  fi
+else
+  print_warning "No timeout command found (assessments will run without timeout)"
+  print_info "Install: brew install coreutils"
+fi
+echo ""
+
 # Check 5: Required directories
 print_info "Checking required directories..."
 
