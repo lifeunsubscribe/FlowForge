@@ -16,5 +16,6 @@ node_modules/
 *.log
 tmp/
 
-# Local development state
-.forge/
+# Local development state (worktree symlinks)
+.rite/
+.claude/

@@ -123,6 +123,18 @@ DIFF_FILES=$(echo "$PR_DIFF" | grep -c "^diff --git" || echo "0")
 print_info "Diff size: $DIFF_FILES files, $DIFF_LINES lines"
 echo ""
 
+# Handle empty diff
+if [ "$DIFF_FILES" -eq 0 ] || [ -z "$PR_DIFF" ] || [ "$PR_DIFF" = "" ]; then
+  print_warning "No code changes to review"
+  print_info "This PR has no diff against the base branch."
+  print_info "Possible reasons:"
+  echo "  • PR only has placeholder commit (no implementation yet)"
+  echo "  • All changes were reverted"
+  echo "  • Branch is identical to base"
+  echo ""
+  exit 0
+fi
+
 # Load review instructions template
 # Priority: 1. Repo-specific (.github/claude-code/), 2. Forge default, 3. Embedded fallback
 # Use absolute path from RITE_PROJECT_ROOT to avoid CWD dependency
@@ -171,6 +183,9 @@ fi
 # Get current timestamp for review metadata
 REVIEW_TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
+# Use consistent model for reviews (matches assessment model for determinism)
+EFFECTIVE_MODEL="${RITE_REVIEW_MODEL:-opus}"
+
 # Build the full prompt
 REVIEW_PROMPT="$REVIEW_INSTRUCTIONS
 $PROJECT_CONTEXT
@@ -218,9 +233,6 @@ echo ""
 
 # Run Claude to generate the review
 CLAUDE_STDERR=$(mktemp)
-
-# Use consistent model for reviews (matches assessment model for determinism)
-EFFECTIVE_MODEL="${RITE_REVIEW_MODEL:-opus}"
 
 # Build Claude args with model flag
 CLAUDE_ARGS="--print"

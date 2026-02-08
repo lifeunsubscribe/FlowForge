@@ -381,7 +381,9 @@ if [ "$blocker_detected" = true ]; then
   echo "$blocker_details"
   echo ""
   print_info "This PR requires manual review before proceeding"
-  print_info "Run in supervised mode to review and approve: rite <issue> --supervised"
+  if [ "$AUTO_MODE" = true ]; then
+    print_info "Run in supervised mode to review and approve: rite <issue> --supervised"
+  fi
   echo ""
 
   # Write blocker details to file for workflow-runner to read

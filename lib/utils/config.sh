@@ -92,7 +92,7 @@ SESSION_STATE_FILE="${SESSION_STATE_FILE:-/tmp/rite-session-state-${RITE_PROJECT
 # Claude Code timeout (seconds, default 2 hours)
 RITE_CLAUDE_TIMEOUT="${RITE_CLAUDE_TIMEOUT:-7200}"
 
-# Claude Code model (empty = use Claude Code default, e.g. "opus", "sonnet", "haiku")
+# Claude model (empty = use default, e.g. "opus", "sonnet", "haiku")
 RITE_CLAUDE_MODEL="${RITE_CLAUDE_MODEL:-}"
 
 # Model for reviews and assessments (default: opus for quality)
@@ -102,11 +102,11 @@ RITE_REVIEW_MODEL="${RITE_REVIEW_MODEL:-opus}"
 # Assessment cache directory (stores cached assessments by review hash)
 RITE_ASSESSMENT_CACHE_DIR="${RITE_ASSESSMENT_CACHE_DIR:-$RITE_DATA_DIR/assessment-cache}"
 
-# Review method: "app" | "local" | "auto" (default: auto)
+# Review method: "app" | "local" | "auto" (default: local)
 #   - "app": Use Claude for GitHub app only (fail if not installed)
 #   - "local": Use local Claude Code review only (never wait for app)
 #   - "auto": Try app first, fallback to local if not available or stale
-RITE_REVIEW_METHOD="${RITE_REVIEW_METHOD:-auto}"
+RITE_REVIEW_METHOD="${RITE_REVIEW_METHOD:-local}"
 
 # Dry-run mode
 RITE_DRY_RUN="${RITE_DRY_RUN:-false}"

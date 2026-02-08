@@ -314,9 +314,33 @@ REVIEW_JSON=$(gh pr view "$PR_NUMBER" --json comments --jq '[.comments[] | selec
 rm -f "$GH_STDERR"
 
 if [ "$REVIEW_JSON" = "{}" ] || [ -z "$REVIEW_JSON" ] || [ "$REVIEW_JSON" = "null" ]; then
-  print_error "No review found"
-  echo "Run local review: /Users/sarahtime/Dev/forge/lib/core/local-review.sh $PR_NUMBER --post"
-  exit 1
+  # No review found - auto-generate one
+  print_info "No review found - generating local review..."
+  echo ""
+
+  # Run local review with --post --auto
+  LOCAL_REVIEW_SCRIPT="$RITE_LIB_DIR/core/local-review.sh"
+  if [ -f "$LOCAL_REVIEW_SCRIPT" ]; then
+    if "$LOCAL_REVIEW_SCRIPT" "$PR_NUMBER" --post --auto; then
+      print_success "Local review posted"
+      echo ""
+
+      # Re-fetch the review we just posted
+      sleep 2  # Give GitHub a moment to index
+      REVIEW_JSON=$(gh pr view "$PR_NUMBER" --json comments --jq '[.comments[] | select(.body | contains("<!-- sharkrite-local-review"))] | .[-1]' 2>/dev/null) || true
+
+      if [ "$REVIEW_JSON" = "{}" ] || [ -z "$REVIEW_JSON" ] || [ "$REVIEW_JSON" = "null" ]; then
+        print_error "Failed to fetch newly posted review"
+        exit 1
+      fi
+    else
+      print_error "Local review generation failed"
+      exit 1
+    fi
+  else
+    print_error "Local review script not found: $LOCAL_REVIEW_SCRIPT"
+    exit 1
+  fi
 fi
 
 REVIEW_BODY=$(echo "$REVIEW_JSON" | jq -r '.body' 2>/dev/null || echo "")

@@ -419,10 +419,10 @@ phase_claude_workflow() {
           UNCOMMITTED_FILES=$(git -C "$WORKTREE_PATH" status --porcelain 2>/dev/null | grep -vE "^\?\?" || echo "")
 
           if [ -z "$UNCOMMITTED_FILES" ]; then
-            print_info "No tracked file changes (only untracked files)"
+            echo "   ℹ️  No tracked file changes (only untracked files)"
           else
             # Use Claude CLI to analyze if changes are relevant to the issue
-            print_info "Analyzing if changes are relevant to issue #$issue_number..."
+            echo "   ℹ️  Analyzing if changes are relevant to issue #$issue_number..."
 
             # Create temp file for prompt to avoid heredoc issues
             PROMPT_FILE=$(mktemp)
@@ -452,42 +452,42 @@ EOF
 
             # If Claude CLI failed or returned nothing, fail hard
             if [ -z "$RELEVANCE" ]; then
-              print_error "Claude CLI failed to analyze changes"
-              print_error "Cannot proceed without determining relevance"
+              echo "   ❌ Claude CLI failed to analyze changes"
+              echo "   ❌ Cannot proceed without determining relevance"
               echo ""
-              echo "Uncommitted changes:"
-              echo "$UNCOMMITTED_FILES"
+              echo "   Uncommitted changes:"
+              echo "$UNCOMMITTED_FILES" | sed 's/^/   /'
               echo ""
-              echo "Please manually commit or stash changes in: $WORKTREE_PATH"
+              echo "   Please manually commit or stash changes in: $WORKTREE_PATH"
               exit 1
             fi
 
-            print_info "Assessment: $RELEVANCE"
+            echo "   ℹ️  Assessment: $RELEVANCE"
 
             if [ "$RELEVANCE" = "RELEVANT" ]; then
               # Changes are relevant - commit them
-              print_success "Changes are relevant to issue #$issue_number - committing..."
+              echo "   ✅ Changes are relevant to issue #$issue_number - committing..."
 
               cd "$WORKTREE_PATH" || exit 1
               git add -u  # Only add tracked files (not symlinks)
               COMMIT_MSG="wip: auto-commit relevant changes for issue #$issue_number ($(date +%Y-%m-%d))"
 
               if git commit -m "$COMMIT_MSG" 2>/dev/null; then
-                print_success "Changes committed: $COMMIT_MSG"
+                echo "   ✅ Changes committed: $COMMIT_MSG"
               else
                 print_error "Failed to commit changes"
                 exit 1
               fi
             else
               # Changes are unrelated - stash them, will be popped after workflow completes
-              print_info "Changes are unrelated to issue #$issue_number - stashing..."
+              echo "   ℹ️  Changes are unrelated to issue #$issue_number - stashing..."
 
               cd "$WORKTREE_PATH" || exit 1
               STASH_MSG="Auto-stash unrelated work before issue #$issue_number ($(date +%Y-%m-%d))"
 
               if git stash push -u -m "$STASH_MSG" 2>/dev/null; then
-                print_success "Changes stashed: $STASH_MSG"
-                print_info "Will be restored after workflow completes"
+                echo "   ✅ Changes stashed: $STASH_MSG"
+                echo "   ℹ️  Will be restored after workflow completes"
 
                 # Set flag to pop stash at end of workflow
                 export STASHED_UNRELATED_WORK=true
@@ -500,11 +500,35 @@ EOF
           fi
         fi
 
-        print_info "Skipping Phase 1 - PR already exists, proceeding to Phase 2"
-        # CRITICAL: Return here to skip worktree creation logic below
-        # The worktree already exists and WORKTREE_PATH is set
-        print_success "Development phase complete"
-        return 0
+        # Check if PR has actual file changes (not just placeholder commit)
+        cd "$WORKTREE_PATH" || exit 1
+        FILE_CHANGES=$(git diff --name-only origin/main..HEAD 2>/dev/null | wc -l | tr -d ' ')
+
+        if [ "$FILE_CHANGES" -gt 0 ]; then
+          print_info "PR #$pr_number has $FILE_CHANGES file(s) changed - skipping to Phase 2"
+          print_success "Development phase complete"
+          return 0
+        else
+          # PR exists but has no real work - need to run development
+          print_info "PR #$pr_number exists but has no implementation yet"
+          print_info "Running development phase..."
+
+          # Call claude-workflow.sh to do the actual development work
+          if [ "$WORKFLOW_MODE" = "supervised" ]; then
+            "$CLAUDE_WORKFLOW" "$issue_number"
+          else
+            "$CLAUDE_WORKFLOW" "$issue_number" --auto
+          fi
+
+          WORKFLOW_EXIT=$?
+          if [ $WORKFLOW_EXIT -ne 0 ]; then
+            print_error "Development workflow failed"
+            return $WORKFLOW_EXIT
+          fi
+
+          print_success "Development phase complete"
+          return 0
+        fi
       else
         print_error "PR exists but worktree not found - manual intervention required"
         print_error "Run: git worktree add $RITE_WORKTREE_DIR/$pr_branch $pr_branch"

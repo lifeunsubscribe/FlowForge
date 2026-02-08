@@ -155,9 +155,31 @@ while [[ $# -gt 0 ]]; do
         ISSUE_NUMBER="$1"
         echo "▶  Fetching issue #$ISSUE_NUMBER from GitHub..."
         # Fetch issue details from GitHub
-        ISSUE_JSON=$(gh issue view "$ISSUE_NUMBER" --json title,body 2>/dev/null || echo "")
+        ISSUE_JSON=$(gh issue view "$ISSUE_NUMBER" --json title,body,state 2>/dev/null || echo "")
         if [ -n "$ISSUE_JSON" ] && [ "$ISSUE_JSON" != "null" ]; then
           ISSUE_DESC=$(echo "$ISSUE_JSON" | jq -r '.title')
+          ISSUE_BODY=$(echo "$ISSUE_JSON" | jq -r '.body // ""')
+          ISSUE_STATE=$(echo "$ISSUE_JSON" | jq -r '.state')
+
+          # Validate issue has meaningful content
+          if [ -z "$ISSUE_DESC" ] || [ "$ISSUE_DESC" = "null" ]; then
+            echo "❌ Issue #$ISSUE_NUMBER has no title"
+            echo "   Cannot proceed without a task description"
+            exit 1
+          fi
+
+          # Warn if body is empty (but don't fail - title might be enough)
+          if [ -z "$ISSUE_BODY" ] || [ "$ISSUE_BODY" = "null" ]; then
+            echo "⚠️  Issue #$ISSUE_NUMBER has no description body"
+            echo "   Will use title only: $ISSUE_DESC"
+          fi
+
+          # Warn if issue is closed
+          if [ "$ISSUE_STATE" = "CLOSED" ]; then
+            echo "⚠️  Issue #$ISSUE_NUMBER is already CLOSED"
+            echo "   Proceeding anyway (may be reopening work)"
+          fi
+
           echo "✅ Issue loaded: $ISSUE_DESC"
         else
           echo "❌ Issue #$ISSUE_NUMBER not found on GitHub"
@@ -472,9 +494,17 @@ if ! command -v gh &> /dev/null; then
   exit 1
 fi
 
-CLAUDE_CMD="npx @anthropic-ai/claude-code"
-if command -v claude-code &> /dev/null; then
+# Detect Claude CLI (claude is the current name, claude-code was the old name)
+if command -v claude &> /dev/null; then
+  CLAUDE_CMD="claude"
+elif command -v claude-code &> /dev/null; then
   CLAUDE_CMD="claude-code"
+elif [ -f "$HOME/.claude/claude" ]; then
+  CLAUDE_CMD="$HOME/.claude/claude"
+else
+  print_error "Claude CLI not found"
+  print_info "Install: npm install -g @anthropic-ai/claude-code"
+  exit 1
 fi
 
 # Apply model override if configured
@@ -564,20 +594,30 @@ if [ -z "$ISSUE_NUMBER" ]; then
       exit 0
     fi
 
-    # PR already exists - jump directly to PR workflow
-    # (workflow-runner already printed PR details to user)
-    echo ""
+    # PR exists but is it just a placeholder? Check for actual file changes
+    FILE_CHANGES=$(git diff --name-only origin/main..HEAD 2>/dev/null | wc -l | tr -d ' ')
 
-    # Jump directly to PR workflow script - skip everything else
-    if [ -f "$RITE_LIB_DIR/core/create-pr.sh" ]; then
-      if [ "$AUTO_MODE" = true ]; then
-        exec "$RITE_LIB_DIR/core/create-pr.sh" --auto
+    if [ "$FILE_CHANGES" -gt 0 ]; then
+      # PR has real work - jump directly to PR workflow
+      print_info "PR #$PR_NUMBER has $FILE_CHANGES file(s) changed - proceeding to review workflow"
+      echo ""
+
+      # Jump directly to PR workflow script - skip development phase
+      if [ -f "$RITE_LIB_DIR/core/create-pr.sh" ]; then
+        if [ "$AUTO_MODE" = true ]; then
+          exec "$RITE_LIB_DIR/core/create-pr.sh" --auto
+        else
+          exec "$RITE_LIB_DIR/core/create-pr.sh"
+        fi
       else
-        exec "$RITE_LIB_DIR/core/create-pr.sh"
+        print_error "create-pr.sh not found"
+        exit 1
       fi
     else
-      print_error "create-pr.sh not found"
-      exit 1
+      # PR exists but only has placeholder commit - need to run development
+      print_info "PR #$PR_NUMBER exists but has no implementation yet"
+      print_info "Running development phase..."
+      echo ""
     fi
   else
     print_info "No PR exists yet for this branch"
@@ -944,6 +984,34 @@ If the changes are unrelated work, answer UNRELATED."
       ln -s "$MAIN_WORKTREE/.claude" "$WORKTREE_PATH/.claude"
     fi
 
+    # Ensure worktree symlinks are in target repo's gitignore
+    # This prevents them from showing up as untracked files
+    ensure_symlinks_gitignored() {
+      local gitignore="$WORKTREE_PATH/.gitignore"
+      local patterns=(".rite/" ".claude/" "node_modules/" "backend/node_modules/")
+      local added=0
+
+      for pattern in "${patterns[@]}"; do
+        # Check if pattern exists in gitignore (accounting for leading slash or not)
+        local check_pattern="${pattern%/}"  # Remove trailing slash for grep
+        if [ -f "$gitignore" ] && grep -qE "^/?${check_pattern}/?$" "$gitignore" 2>/dev/null; then
+          continue  # Already ignored
+        fi
+
+        # Only add if the symlink actually exists
+        local check_path="$WORKTREE_PATH/${check_pattern}"
+        if [ -L "$check_path" ] || [ -d "$check_path" ]; then
+          echo "$pattern" >> "$gitignore"
+          ((added++)) || true
+        fi
+      done
+
+      if [ "$added" -gt 0 ]; then
+        print_info "Added $added symlink pattern(s) to .gitignore"
+      fi
+    }
+    ensure_symlinks_gitignored
+
     # Switch to worktree directory
     cd "$WORKTREE_PATH"
     print_success "Switched to worktree: $WORKTREE_PATH"
@@ -1051,6 +1119,8 @@ fi
 # Build Claude Code prompt
 print_header "🤖 Starting Claude Code Session"
 
+echo ""
+
 # Show workflow summary
 echo "📋 Workflow Summary:"
 echo "   Issue: ${ISSUE_NUMBER:+#$ISSUE_NUMBER - }$ISSUE_DESC"
@@ -1138,7 +1208,7 @@ if [ "$AUTO_MODE" = true ]; then
   AUTO_MODE_INSTRUCTION="Proceed directly to implementation (auto mode - no approval needed)"
   AUTO_MODE_FINAL_NOTE="**Auto Mode**: Complete all phases automatically. After Phase 5:
 1. Provide a brief summary of what you implemented
-2. **IMPORTANT: Exit Claude Code immediately** by typing \`/quit\` or \`/exit\`
+2. **IMPORTANT: Exit the session immediately** by typing \`/quit\` or \`/exit\`
 3. The post-workflow script will automatically handle commit, push, and PR creation
 
 **You must exit after completing Phase 5 for the automation to continue!**"
@@ -1245,39 +1315,41 @@ else
   CLAUDE_TIMEOUT=${RITE_CLAUDE_TIMEOUT:-7200}
   print_info "Launching Claude Code (timeout: ${CLAUDE_TIMEOUT}s)..."
 
-  if [ "$AUTO_MODE" = true ]; then
-    timeout "${CLAUDE_TIMEOUT}" $CLAUDE_CMD --permission-mode bypassPermissions "$CLAUDE_PROMPT" &
-    CLAUDE_PID=$!
+  # Detect timeout command (gtimeout on macOS via coreutils, timeout on Linux)
+  if command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT_CMD="gtimeout"
+  elif command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_CMD="timeout"
   else
-    timeout "${CLAUDE_TIMEOUT}" $CLAUDE_CMD "$CLAUDE_PROMPT" &
-    CLAUDE_PID=$!
+    print_warning "No timeout command found - running without timeout"
+    print_info "Install coreutils for timeout support: brew install coreutils"
+    TIMEOUT_CMD=""
   fi
 
-  # In auto mode, show periodic heartbeat while waiting
-  if [ "$AUTO_MODE" = true ]; then
-    (
-      elapsed=0
-      while kill -0 $CLAUDE_PID 2>/dev/null; do
-        sleep 60
-        elapsed=$((elapsed + 60))
-        echo "⏱️  Claude Code running... (${elapsed}s elapsed)"
-      done
-    ) &
-    HEARTBEAT_PID=$!
-  fi
-
-  # Wait for Claude Code to complete
+  # Both modes run in FOREGROUND for streaming output
+  # Auto mode: uses --permission-mode bypassPermissions (no approval prompts)
+  # Supervised mode: full interactive experience
   CLAUDE_EXIT_CODE=0
-  wait $CLAUDE_PID || CLAUDE_EXIT_CODE=$?
 
-  # Stop heartbeat if running
-  if [ -n "${HEARTBEAT_PID:-}" ]; then
-    kill $HEARTBEAT_PID 2>/dev/null || true
-    wait $HEARTBEAT_PID 2>/dev/null || true
+  if [ "$AUTO_MODE" = true ]; then
+    # Auto mode: bypass permissions for unattended execution
+    if [ -n "$TIMEOUT_CMD" ]; then
+      $TIMEOUT_CMD "${CLAUDE_TIMEOUT}" $CLAUDE_CMD --permission-mode bypassPermissions "$CLAUDE_PROMPT" || CLAUDE_EXIT_CODE=$?
+    else
+      $CLAUDE_CMD --permission-mode bypassPermissions "$CLAUDE_PROMPT" || CLAUDE_EXIT_CODE=$?
+    fi
+  else
+    # Supervised mode: interactive with approval prompts
+    if [ -n "$TIMEOUT_CMD" ]; then
+      $TIMEOUT_CMD "${CLAUDE_TIMEOUT}" $CLAUDE_CMD "$CLAUDE_PROMPT" || CLAUDE_EXIT_CODE=$?
+    else
+      $CLAUDE_CMD "$CLAUDE_PROMPT" || CLAUDE_EXIT_CODE=$?
+    fi
   fi
 
-  # Handle timeout (exit code 124 from timeout command)
+  # Handle exit codes
   if [ $CLAUDE_EXIT_CODE -eq 124 ]; then
+    # Timeout
     print_error "Claude Code timed out after ${CLAUDE_TIMEOUT}s"
     print_info "Checking for uncommitted work..."
 
@@ -1288,6 +1360,13 @@ else
       print_error "No changes detected - workflow failed"
       exit 1
     fi
+  elif [ $CLAUDE_EXIT_CODE -eq 127 ]; then
+    # Command not found - this is a setup error, not recoverable
+    print_error "Command not found (exit code 127)"
+    print_error "This usually means a required tool is missing."
+    print_info "Check that 'claude' CLI is installed: npm install -g @anthropic-ai/claude-code"
+    print_info "Check that 'gtimeout' is installed on macOS: brew install coreutils"
+    exit 127
   elif [ $CLAUDE_EXIT_CODE -ne 0 ]; then
     print_error "Claude Code exited with error code $CLAUDE_EXIT_CODE"
     print_info "Checking for uncommitted work..."
@@ -1321,10 +1400,41 @@ else
 if [ $CHANGES_COUNT -eq 0 ]; then
   print_info "No new changes detected"
   echo ""
-  print_info "Checking if PR workflow is needed (branch may have existing commits)..."
 
-  # Skip to PR workflow - there may be existing commits that need PR/review
-  # Even without new changes, we should check for PR, review feedback, etc.
+  # Check if there are any actual file changes (more reliable than commit message parsing)
+  FILE_CHANGES=$(git diff --name-only origin/main..HEAD 2>/dev/null | wc -l | tr -d ' ')
+
+  if [ "$FILE_CHANGES" -eq 0 ]; then
+    # No work was done in the dev phase - exit early
+    print_warning "No work was done in the development phase"
+    echo ""
+    print_info "The workflow will exit without creating a PR."
+    print_info "This can happen if:"
+    echo "  • The task was already complete"
+    echo "  • Claude Code determined no changes were needed"
+    echo "  • The session timed out before making changes"
+    echo ""
+
+    # Clean up the empty branch if we created it
+    CURRENT_BRANCH=$(git branch --show-current)
+    if [ -n "$CURRENT_BRANCH" ] && [ "$CURRENT_BRANCH" != "main" ]; then
+      # Check if this is an empty branch we just created
+      if git log --oneline origin/main..HEAD 2>/dev/null | grep -q "chore: initialize work"; then
+        print_info "Cleaning up empty branch..."
+
+        # Delete the draft PR if it exists
+        DRAFT_PR=$(gh pr list --head "$CURRENT_BRANCH" --json number --jq '.[0].number' 2>/dev/null || echo "")
+        if [ -n "$DRAFT_PR" ]; then
+          gh pr close "$DRAFT_PR" --delete-branch 2>/dev/null || true
+          print_info "Closed draft PR #$DRAFT_PR"
+        fi
+      fi
+    fi
+
+    exit 0
+  fi
+
+  print_info "Found $FILE_CHANGES file(s) changed - proceeding to PR workflow"
 else
   print_success "$CHANGES_COUNT file(s) changed"
   echo ""
