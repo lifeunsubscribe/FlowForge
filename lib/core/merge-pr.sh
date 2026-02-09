@@ -22,37 +22,6 @@ if [ -f "$RITE_LIB_DIR/utils/scratchpad-manager.sh" ]; then
   source "$RITE_LIB_DIR/utils/scratchpad-manager.sh"
 fi
 
-# =============================================================================
-# CACHE CLEANUP: Remove cached assessments for merged PRs
-# =============================================================================
-
-cleanup_pr_cache() {
-  local pr_num="$1"
-  local cache_dir="$RITE_PROJECT_ROOT/${RITE_ASSESSMENT_CACHE_DIR:-.rite/assessment-cache}"
-
-  if [ ! -d "$cache_dir" ]; then
-    return 0
-  fi
-
-  # Find and remove cache entries for this PR
-  local removed=0
-  while IFS= read -r meta; do
-    local base="${meta%.meta}"
-    rm -f "$base.json" "$meta" 2>/dev/null
-    ((removed++)) || true
-  done < <(find "$cache_dir" -name "*.meta" -exec grep -l "\"pr_number\": \"$pr_num\"" {} \; 2>/dev/null)
-
-  # Also clean up the "previous assessment" file used for cross-iteration determinism
-  if [ -f "$cache_dir/pr-${pr_num}-previous.json" ]; then
-    rm -f "$cache_dir/pr-${pr_num}-previous.json" "$cache_dir/pr-${pr_num}-previous.meta" 2>/dev/null
-    ((removed++)) || true
-  fi
-
-  if [ "$removed" -gt 0 ]; then
-    print_info "Cleaned $removed cached assessments for merged PR #$pr_num"
-  fi
-}
-
 # Parse arguments
 AUTO_MODE=false
 PR_NUMBER=""
@@ -849,9 +818,6 @@ if [ $MERGE_EXIT_CODE -eq 0 ]; then
 
   # Check for security findings and update guide
   update_security_guide_from_pr "$PR_NUMBER"
-
-  # Clean up cached assessments for this PR (no longer needed after merge)
-  cleanup_pr_cache "$PR_NUMBER"
 
   # Update scratchpad with security findings (BEFORE clearing context)
   if type update_scratchpad_from_pr &>/dev/null; then

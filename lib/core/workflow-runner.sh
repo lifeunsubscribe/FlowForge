@@ -601,20 +601,7 @@ phase_create_pr() {
   set -e  # Re-enable exit-on-error
 
   # Handle exit codes from create-pr.sh
-  if [ $create_pr_exit -eq 10 ]; then
-    # Blocker detected in early detection - load blocker info and handle properly
-    if [ -f "${RITE_PROJECT_ROOT:-.}/.rite/early-blocker.env" ]; then
-      source "${RITE_PROJECT_ROOT:-.}/.rite/early-blocker.env"
-      rm -f "${RITE_PROJECT_ROOT:-.}/.rite/early-blocker.env"
-    fi
-    # handle_blocker returns 0 if user approves (supervised) or bypass enabled
-    # handle_blocker exits 1 if user declines or unsupervised without bypass
-    if ! handle_blocker "pre-merge" "$issue_number" "${PR_NUMBER:-}"; then
-      return 1
-    fi
-    # User approved - continue workflow (skip to phase 3 since PR already exists)
-    return 0
-  elif [ $create_pr_exit -ne 0 ]; then
+  if [ $create_pr_exit -ne 0 ]; then
     print_error "create-pr.sh failed with exit code: $create_pr_exit"
     return 1
   fi
@@ -659,15 +646,9 @@ phase_assess_and_resolve() {
 
   cd "$WORKTREE_PATH"
 
-  # Check for blockers before merge
-  # Pass WORKFLOW_MODE so protected script blocker can allow supervised mode
-  if ! check_blockers "pre-merge" "$pr_number" "$issue_number" "$WORKFLOW_MODE"; then
-    # handle_blocker returns 0 if user approves/bypasses, non-zero if declined/stopped
-    if ! handle_blocker "pre-merge" "$issue_number" "$pr_number"; then
-      return 1
-    fi
-    # User approved - continue with assessment
-  fi
+  # NOTE: Blockers are checked in phase_merge_pr (pre-merge gate), not here.
+  # This lets the review/assessment loop run uninterrupted, giving the user
+  # full context about what the PR contains before the blocker approval prompt.
 
   # Call assess-and-resolve.sh (pass issue number and retry count)
   # This will categorize ALL review issues and either:
@@ -715,14 +696,11 @@ phase_assess_and_resolve() {
   local dismissed_count=0
 
   if [ -n "$review_content" ]; then
-    now_count=$(echo "$review_content" | grep -c "ACTIONABLE_NOW" 2>/dev/null | tr -d '[:space:]' || echo "0")
-    later_count=$(echo "$review_content" | grep -c "ACTIONABLE_LATER" 2>/dev/null | tr -d '[:space:]' || echo "0")
-    dismissed_count=$(echo "$review_content" | grep -c "DISMISSED" 2>/dev/null | tr -d '[:space:]' || echo "0")
-
-    # Validate they're integers
-    [[ ! "$now_count" =~ ^[0-9]+$ ]] && now_count=0
-    [[ ! "$later_count" =~ ^[0-9]+$ ]] && later_count=0
-    [[ ! "$dismissed_count" =~ ^[0-9]+$ ]] && dismissed_count=0
+    # Match structured headers only (^### Title - STATE) to avoid
+    # counting mentions of state names in reasoning text
+    now_count=$(echo "$review_content" | grep -c "^### .* - ACTIONABLE_NOW" || true)
+    later_count=$(echo "$review_content" | grep -c "^### .* - ACTIONABLE_LATER" || true)
+    dismissed_count=$(echo "$review_content" | grep -c "^### .* - DISMISSED" || true)
   fi
 
   # Keep stderr for potential error display, cleanup stdout
@@ -831,6 +809,14 @@ phase_merge_pr() {
   print_header "Phase 4: Merge PR and Update Docs"
 
   cd "$WORKTREE_PATH"
+
+  # Pre-merge blocker gate: check for infrastructure, auth, migration changes etc.
+  # This runs AFTER review/assessment so the user has full context for the decision.
+  if ! check_blockers "pre-merge" "$pr_number" "$issue_number" "$WORKFLOW_MODE"; then
+    if ! handle_blocker "pre-merge" "$issue_number" "$pr_number"; then
+      return 1
+    fi
+  fi
 
   # merge-pr.sh will:
   # - Update security guide with findings from PR review

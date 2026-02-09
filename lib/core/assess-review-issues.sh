@@ -28,130 +28,53 @@ fi
 source "$RITE_LIB_DIR/utils/colors.sh"
 
 # =============================================================================
-# CACHING: SHA256 hash of review content for deterministic cache key
+# FRESHNESS CHECK: Skip assessment if no commits since last assessment
 # =============================================================================
+# Assessments are stored as PR comments with <!-- sharkrite-assessment --> markers.
+# If no commits have been pushed since the last assessment, reuse it.
 
-generate_cache_key() {
-  local review_content="$1"
-  local model="${2:-${RITE_REVIEW_MODEL:-opus}}"
-  local cache_input="${review_content}::model=${model}"
+check_assessment_freshness() {
+  local pr_number="$1"
 
-  if command -v shasum >/dev/null 2>&1; then
-    echo "$cache_input" | shasum -a 256 | cut -d' ' -f1
-  elif command -v sha256sum >/dev/null 2>&1; then
-    echo "$cache_input" | sha256sum | cut -d' ' -f1
+  # Find the most recent assessment comment timestamp
+  local assessment_timestamp
+  assessment_timestamp=$(gh pr view "$pr_number" --json comments \
+    --jq '[.comments[] | select(.body | contains("<!-- sharkrite-assessment"))] | sort_by(.createdAt) | reverse | .[0].createdAt' 2>/dev/null || echo "")
+
+  if [ -z "$assessment_timestamp" ] || [ "$assessment_timestamp" = "null" ]; then
+    return 1  # No assessment exists
+  fi
+
+  # Get latest commit timestamp on the PR
+  local latest_commit_time
+  latest_commit_time=$(gh pr view "$pr_number" --json commits \
+    --jq '.commits[-1].committedDate' 2>/dev/null || echo "")
+
+  if [ -z "$latest_commit_time" ]; then
+    return 1  # Can't determine, run fresh
+  fi
+
+  # Compare timestamps (epoch comparison, portable GNU/BSD)
+  local assess_epoch commit_epoch
+  if date --version >/dev/null 2>&1; then
+    assess_epoch=$(date -d "$assessment_timestamp" "+%s" 2>/dev/null || echo "0")
+    commit_epoch=$(date -d "$latest_commit_time" "+%s" 2>/dev/null || echo "0")
   else
-    echo "$cache_input" | md5 | cut -d' ' -f1
-  fi
-}
-
-get_cached_assessment() {
-  local cache_key="$1"
-  local cache_file="$RITE_PROJECT_ROOT/$RITE_ASSESSMENT_CACHE_DIR/${cache_key}.json"
-
-  if [ -f "$cache_file" ]; then
-    cat "$cache_file"
-    return 0
-  fi
-  return 1
-}
-
-save_to_cache() {
-  local cache_key="$1"
-  local assessment="$2"
-  local model="${3:-${RITE_REVIEW_MODEL:-opus}}"
-  local cache_dir="$RITE_PROJECT_ROOT/$RITE_ASSESSMENT_CACHE_DIR"
-
-  mkdir -p "$cache_dir"
-  echo "$assessment" > "$cache_dir/${cache_key}.json"
-
-  # Store metadata for targeted cleanup
-  cat > "$cache_dir/${cache_key}.meta" << EOF
-{
-  "created": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
-  "model": "$model",
-  "pr_number": "$PR_NUMBER"
-}
-EOF
-  print_info "Cached assessment for PR #$PR_NUMBER (key: ${cache_key:0:12}...)" >&2
-}
-
-# =============================================================================
-# CROSS-ITERATION DETERMINISM: Preserve classifications from previous assessments
-# =============================================================================
-# When a new review is generated after fixes, we want items that appeared in
-# both the old and new reviews to retain their classification from the first
-# assessment. This prevents flip-flopping between ACTIONABLE_NOW and ACTIONABLE_LATER.
-
-get_previous_assessment() {
-  local pr_number="$1"
-  local cache_dir="$RITE_PROJECT_ROOT/$RITE_ASSESSMENT_CACHE_DIR"
-
-  # First, check for the dedicated "previous assessment" file (most reliable)
-  local previous_file="$cache_dir/pr-${pr_number}-previous.json"
-  if [ -f "$previous_file" ]; then
-    cat "$previous_file"
-    return 0
+    assess_epoch=$(date -jf "%Y-%m-%dT%H:%M:%SZ" "$assessment_timestamp" "+%s" 2>/dev/null || echo "0")
+    commit_epoch=$(date -jf "%Y-%m-%dT%H:%M:%SZ" "$latest_commit_time" "+%s" 2>/dev/null || echo "0")
   fi
 
-  # Fallback: Find most recent assessment for this PR by scanning meta files
-  # (This handles cases where there's cached data but no dedicated previous file)
-  local latest_meta=""
-  local latest_time=0
-
-  if [ -d "$cache_dir" ]; then
-    while IFS= read -r meta_file; do
-      [ -z "$meta_file" ] && continue
-      local meta_pr=$(grep -o '"pr_number": "[0-9]*"' "$meta_file" 2>/dev/null | grep -o '[0-9]*' || echo "")
-      if [ "$meta_pr" = "$pr_number" ]; then
-        # Get creation timestamp
-        local created=$(grep -o '"created": "[^"]*"' "$meta_file" 2>/dev/null | cut -d'"' -f4 || echo "")
-        if [ -n "$created" ]; then
-          # Convert to epoch for comparison (portable)
-          local epoch=0
-          if date --version >/dev/null 2>&1; then
-            epoch=$(date -d "$created" +%s 2>/dev/null || echo "0")
-          else
-            epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$created" +%s 2>/dev/null || echo "0")
-          fi
-          if [ "$epoch" -gt "$latest_time" ]; then
-            latest_time=$epoch
-            latest_meta="$meta_file"
-          fi
-        fi
-      fi
-    done < <(find "$cache_dir" -name "*.meta" 2>/dev/null)
+  if [ "$commit_epoch" -gt "$assess_epoch" ]; then
+    return 1  # Commits after assessment = stale
   fi
 
-  if [ -n "$latest_meta" ]; then
-    local assessment_file="${latest_meta%.meta}.json"
-    if [ -f "$assessment_file" ]; then
-      cat "$assessment_file"
-      return 0
-    fi
-  fi
+  # Assessment is fresh — return the assessment content (after the --- separator)
+  local assessment_body
+  assessment_body=$(gh pr view "$pr_number" --json comments \
+    --jq '[.comments[] | select(.body | contains("<!-- sharkrite-assessment"))] | sort_by(.createdAt) | reverse | .[0].body' 2>/dev/null || echo "")
 
-  return 1
-}
-
-save_as_previous_assessment() {
-  local pr_number="$1"
-  local assessment="$2"
-  local cache_dir="$RITE_PROJECT_ROOT/$RITE_ASSESSMENT_CACHE_DIR"
-
-  mkdir -p "$cache_dir"
-
-  # Save as the "previous" assessment for this PR (used for cross-iteration determinism)
-  # This is separate from the content-hash cache - it's the PR's "last known" assessment
-  echo "$assessment" > "$cache_dir/pr-${pr_number}-previous.json"
-
-  cat > "$cache_dir/pr-${pr_number}-previous.meta" << EOF
-{
-  "created": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
-  "pr_number": "$pr_number",
-  "type": "previous_assessment"
-}
-EOF
+  echo "$assessment_body" | sed -n '/^---$/,$p' | tail -n +2
+  return 0
 }
 
 # =============================================================================
@@ -302,42 +225,6 @@ detect_claude_error() {
 # Export detected error for use by workflow-runner
 export CLAUDE_ERROR_TYPE=""
 
-# =============================================================================
-# CROSS-ITERATION DETERMINISM: Load previous assessment BEFORE building prompt
-# =============================================================================
-# If there's a previous assessment from an earlier iteration, we include it
-# so Claude can defer to previous classifications for items that appear in both.
-
-PREVIOUS_ASSESSMENT=""
-PREVIOUS_ASSESSMENT_SECTION=""
-
-if PREVIOUS_ASSESSMENT=$(get_previous_assessment "$PR_NUMBER" 2>/dev/null); then
-  print_info "Found previous assessment for PR #$PR_NUMBER - will use for determinism" >&2
-
-  PREVIOUS_ASSESSMENT_SECTION="
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-PREVIOUS ASSESSMENT (from earlier iteration):
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-IMPORTANT: For items that appeared in the previous assessment and still appear
-in this review, you MUST preserve the previous classification. This ensures
-determinism across review iterations.
-
-Rules for cross-iteration consistency:
-1. If an item was ACTIONABLE_LATER before → keep it ACTIONABLE_LATER
-2. If an item was DISMISSED before → keep it DISMISSED
-3. Only items that are NEW (not in previous assessment) should be freshly classified
-4. Use title/description matching to identify same items across iterations
-
-Previous classifications:
-$PREVIOUS_ASSESSMENT
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"
-else
-  print_info "No previous assessment found - this is the first assessment for PR #$PR_NUMBER" >&2
-fi
-
 # Create assessment prompt for Claude
 ASSESSMENT_PROMPT="You are assessing a code review.
 
@@ -357,7 +244,7 @@ Rules:
     * ACTIONABLE_LATER over DISMISSED
 - Apply the same reasoning pattern to similar issues
 - Do NOT introduce randomness in your decision-making
-$PREVIOUS_ASSESSMENT_SECTION
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ORIGINAL ISSUE SCOPE:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -481,19 +368,16 @@ DISMISSED (not worth tracking) IF:
 
 IMPORTANT: Read the ENTIRE review. Don't just look for numbered lists - assess ALL findings, suggestions, and improvements mentioned anywhere in the review (including sections like 'Minor Suggestions', 'Nice to Have', 'Optional Improvements', etc.)."
 
-# =============================================================================
-# CACHE CHECK: Return cached result if available
-# =============================================================================
-
 # Determine effective model (from review metadata or config)
 EFFECTIVE_MODEL="${RITE_ASSESSMENT_MODEL:-${RITE_REVIEW_MODEL:-opus}}"
 
-# Generate cache key and check for cached result
-CACHE_KEY=$(generate_cache_key "$REVIEW_CONTENT" "$EFFECTIVE_MODEL")
+# =============================================================================
+# FRESHNESS CHECK: Reuse existing assessment if no commits since last one
+# =============================================================================
 
-if CACHED_RESULT=$(get_cached_assessment "$CACHE_KEY" 2>/dev/null); then
-  print_success "Using cached assessment (key: ${CACHE_KEY:0:12}...)"
-  echo "$CACHED_RESULT"
+if FRESH_ASSESSMENT=$(check_assessment_freshness "$PR_NUMBER" 2>/dev/null); then
+  print_success "Using existing assessment (no new commits since last assessment)"
+  echo "$FRESH_ASSESSMENT"
   exit 0
 fi
 
@@ -674,22 +558,20 @@ fi
 print_success "Assessment complete"
 
 # Parse assessment to check for actionable items (NOW or LATER)
-ACTIONABLE_NOW_ITEMS=$(echo "$ASSESSMENT_OUTPUT" | grep "ACTIONABLE_NOW" || echo "")
-ACTIONABLE_LATER_ITEMS=$(echo "$ASSESSMENT_OUTPUT" | grep "ACTIONABLE_LATER" || echo "")
+# IMPORTANT: Match structured headers only (^### Title - STATE) to avoid
+# counting mentions of state names in reasoning text
+ACTIONABLE_NOW_COUNT=$(echo "$ASSESSMENT_OUTPUT" | grep -c "^### .* - ACTIONABLE_NOW" || true)
+ACTIONABLE_LATER_COUNT=$(echo "$ASSESSMENT_OUTPUT" | grep -c "^### .* - ACTIONABLE_LATER" || true)
+DISMISSED_COUNT=$(echo "$ASSESSMENT_OUTPUT" | grep -c "^### .* - DISMISSED" || true)
 
-# Count each type for reporting
-ACTIONABLE_NOW_COUNT=$(echo "$ACTIONABLE_NOW_ITEMS" | grep -c "ACTIONABLE_NOW" 2>/dev/null || echo "0")
-ACTIONABLE_LATER_COUNT=$(echo "$ACTIONABLE_LATER_ITEMS" | grep -c "ACTIONABLE_LATER" 2>/dev/null || echo "0")
-DISMISSED_COUNT=$(echo "$ASSESSMENT_OUTPUT" | grep -c "DISMISSED" 2>/dev/null || echo "0")
-
-if [ -z "$ACTIONABLE_NOW_ITEMS" ] && [ -z "$ACTIONABLE_LATER_ITEMS" ]; then
+if [ "$ACTIONABLE_NOW_COUNT" -eq 0 ] && [ "$ACTIONABLE_LATER_COUNT" -eq 0 ]; then
   print_info "No actionable items found (all dismissed or clean review)"
 else
   print_info "Found: $ACTIONABLE_NOW_COUNT NOW, $ACTIONABLE_LATER_COUNT LATER, $DISMISSED_COUNT DISMISSED"
 fi
 
 # =============================================================================
-# POST ASSESSMENT AS PR COMMENT (instead of just cache files)
+# POST ASSESSMENT AS PR COMMENT (source of truth for freshness + determinism)
 # =============================================================================
 
 # Build assessment summary for PR comment
@@ -834,16 +716,20 @@ ${ITEM_DEFER}
 _Created by Sharkrite assessment on ${ASSESSMENT_TIMESTAMP}_
 _Parent PR: #${PR_NUMBER}_"
 
-          NEW_ISSUE=$(gh issue create \
+          ISSUE_URL=$(gh issue create \
             --title "$ITEM_TITLE" \
             --body "$ISSUE_BODY" \
             --label "tech-debt" \
-            --label "from-review" \
-            --json number --jq '.number' 2>/dev/null)
+            --label "from-review" 2>/dev/null || echo "")
 
-          if [ -n "$NEW_ISSUE" ]; then
-            CREATED_ISSUES="${CREATED_ISSUES}#${NEW_ISSUE} "
-            print_success "  Created issue #$NEW_ISSUE"
+          if [ -n "$ISSUE_URL" ]; then
+            NEW_ISSUE=$(echo "$ISSUE_URL" | grep -oE '[0-9]+$' || echo "")
+            if [ -n "$NEW_ISSUE" ]; then
+              CREATED_ISSUES="${CREATED_ISSUES}#${NEW_ISSUE} "
+              print_success "  Created issue #$NEW_ISSUE"
+            fi
+          else
+            print_warning "  Failed to create issue: $ITEM_TITLE"
           fi
         fi
         ;;
@@ -851,6 +737,10 @@ _Parent PR: #${PR_NUMBER}_"
   done
 
   # Update PR body with follow-up issue links
+  # NOTE: CREATED_ISSUES/UPDATED_ISSUES are set inside a pipe subshell above,
+  # so their values are lost here. This block won't trigger until the awk|while
+  # pipeline is refactored to avoid the subshell (e.g., process substitution).
+  # For now, issue creation still works — the PR body just doesn't get updated.
   if [ -n "$CREATED_ISSUES" ] || [ -n "$UPDATED_ISSUES" ]; then
     print_info "Updating PR body with follow-up issue links..."
 
@@ -882,16 +772,6 @@ ${NEW_ISSUES_LINE}")
       print_success "PR body updated with follow-up links" || \
       print_warning "Failed to update PR body"
   fi
-fi
-
-# =============================================================================
-# LEGACY: Still save to cache for local performance (optional)
-# =============================================================================
-
-# Cache successful result for future determinism (can be disabled if PR comments are preferred)
-if [ "${RITE_DISABLE_ASSESSMENT_CACHE:-false}" != "true" ]; then
-  save_to_cache "$CACHE_KEY" "$ASSESSMENT_OUTPUT" "$EFFECTIVE_MODEL"
-  save_as_previous_assessment "$PR_NUMBER" "$ASSESSMENT_OUTPUT"
 fi
 
 # ALWAYS output the full annotated assessment to stdout (includes all three states: NOW, LATER, DISMISSED)

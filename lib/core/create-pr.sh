@@ -154,11 +154,22 @@ if [ ! -z "$EXISTING_PR" ] && [ "$EXISTING_PR" != "null" ]; then
   if [ "$CURRENT_HEAD" != "$PR_HEAD" ]; then
     # Push new commits to PR first
     print_info "Pushing new commits to PR..."
-    git push origin "$CURRENT_BRANCH" 2>&1 | grep -v "To github.com" || true
+    if ! git push origin "$CURRENT_BRANCH"; then
+      print_error "Failed to push commits to remote"
+      print_info "Your branch may be behind the remote. Try: git pull --rebase origin $CURRENT_BRANCH"
+      exit 1
+    fi
 
-    # Update PR description with latest changes
+    # Update PR description with latest changes (preserve issue link for undo discovery + GitHub auto-close)
     print_info "Updating PR description..."
-    UPDATED_BODY="## Recent Changes
+    EXISTING_BODY=$(gh pr view "$PR_NUMBER" --json body --jq '.body' 2>/dev/null || echo "")
+    ISSUE_LINK=$(echo "$EXISTING_BODY" | grep -oE '(Closes|closes|Fixes|fixes|Resolves|resolves) #[0-9]+' | head -1)
+
+    UPDATED_BODY="## Summary
+
+${ISSUE_LINK:+$ISSUE_LINK}
+
+## Recent Changes
 
 $(git log --oneline origin/$BASE_BRANCH..HEAD 2>/dev/null | head -10)
 
@@ -376,19 +387,14 @@ fi
 set -e  # Re-enable exit-on-error
 
 if [ "$blocker_detected" = true ]; then
-  # Write blocker details to file for workflow-runner to read and display
-  # (exports don't persist across process boundaries)
-  # workflow-runner's handle_blocker will show the full details
-  mkdir -p "${RITE_PROJECT_ROOT:-.}/.rite"
-  cat > "${RITE_PROJECT_ROOT:-.}/.rite/early-blocker.env" <<EOF
-BLOCKER_TYPE="$blocker_type"
-BLOCKER_DETAILS="$blocker_details"
-PR_NUMBER="$PR_NUMBER"
-EOF
-  exit 10  # Exit code 10 signals blocker detected
+  # Non-blocking warning: blockers will gate at merge time (not here)
+  # This gives the user early awareness while still letting review/assessment run
+  print_warning "Blocker detected: $blocker_type (will require approval before merge)"
+  echo "$blocker_details" | head -5
+  echo ""
+else
+  print_success "No file-based blockers detected"
 fi
-
-print_success "No file-based blockers detected"
 echo ""
 
 # Determine review method based on config (app, local, or auto)

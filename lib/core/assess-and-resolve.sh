@@ -293,9 +293,8 @@ if ! command -v jq &> /dev/null; then
   exit 1
 fi
 
-print_header "📊 PR Review Assessment - PR #$PR_NUMBER"
-
 # Fetch PR review (from Claude for GitHub bot OR local sharkrite review)
+# (header already printed by workflow-runner.sh with PR + issue context)
 GH_STDERR=$(mktemp)
 REVIEW_JSON=$(gh pr view "$PR_NUMBER" --json comments --jq '[.comments[] | select(.author.login == "claude" or .author.login == "claude[bot]" or .author.login == "github-actions[bot]" or (.body | contains("<!-- sharkrite-local-review -->")))] | .[-1]' 2>"$GH_STDERR") || {
   GH_ERROR=$(cat "$GH_STDERR")
@@ -579,14 +578,11 @@ if [ -f "$RITE_LIB_DIR/core/assess-review-issues.sh" ]; then
     print_success "Smart assessment complete - three-state categorization applied"
 
     # Parse three-state actionability (keep in variable, no temp file!)
-    ACTIONABLE_NOW_COUNT=$(echo "$ASSESSMENT_RESULT" | grep -c "ACTIONABLE_NOW" 2>/dev/null | tr -d '[:space:]') || true
-    ACTIONABLE_LATER_COUNT=$(echo "$ASSESSMENT_RESULT" | grep -c "ACTIONABLE_LATER" 2>/dev/null | tr -d '[:space:]') || true
-    DISMISSED_COUNT=$(echo "$ASSESSMENT_RESULT" | grep -c "DISMISSED" 2>/dev/null | tr -d '[:space:]') || true
-
-    # Validate they're actual integers
-    [[ ! "$ACTIONABLE_NOW_COUNT" =~ ^[0-9]+$ ]] && ACTIONABLE_NOW_COUNT=0
-    [[ ! "$ACTIONABLE_LATER_COUNT" =~ ^[0-9]+$ ]] && ACTIONABLE_LATER_COUNT=0
-    [[ ! "$DISMISSED_COUNT" =~ ^[0-9]+$ ]] && DISMISSED_COUNT=0
+    # IMPORTANT: Match structured headers only (^### Title - STATE) to avoid
+    # counting mentions of state names in reasoning text
+    ACTIONABLE_NOW_COUNT=$(echo "$ASSESSMENT_RESULT" | grep -c "^### .* - ACTIONABLE_NOW" || true)
+    ACTIONABLE_LATER_COUNT=$(echo "$ASSESSMENT_RESULT" | grep -c "^### .* - ACTIONABLE_LATER" || true)
+    DISMISSED_COUNT=$(echo "$ASSESSMENT_RESULT" | grep -c "^### .* - DISMISSED" || true)
 
     # Print detailed assessment breakdown FIRST (shows reasoning for each item)
     print_assessment_details "$ASSESSMENT_RESULT" || {
@@ -632,7 +628,7 @@ if [ -f "$RITE_LIB_DIR/core/assess-review-issues.sh" ]; then
         print_warning "⚠️  At retry limit ($RETRY_COUNT/3) with $ACTIONABLE_NOW_COUNT ACTIONABLE_NOW items remaining"
 
         # Check if any ACTIONABLE_NOW items are CRITICAL
-        CRITICAL_NOW_COUNT=$(echo "$ASSESSMENT_RESULT" | grep "ACTIONABLE_NOW" | grep -c -i "CRITICAL" 2>/dev/null || echo "0")
+        CRITICAL_NOW_COUNT=$(echo "$ASSESSMENT_RESULT" | grep -A 2 "^### .* - ACTIONABLE_NOW" | grep -ci "Severity:.*CRITICAL" || true)
 
         if [ "$CRITICAL_NOW_COUNT" -gt 0 ]; then
           print_critical "🚨 $CRITICAL_NOW_COUNT CRITICAL items remain at retry limit"
@@ -656,18 +652,15 @@ if [ -f "$RITE_LIB_DIR/core/assess-review-issues.sh" ]; then
 
         # Extract counts from FILTERED_ASSESSMENT for Issue Summary display
         # This ensures counts are populated before the summary is shown
-        # Format: "### Title - ACTIONABLE_NOW" on one line, "**Severity:** CRITICAL" on another
+        # Match structured headers (^### Title - STATE) then check severity on next lines
         if [ -n "${FILTERED_ASSESSMENT:-}" ]; then
-          # Extract actionable items (excluding DISMISSED), then count by severity
-          _ACTIONABLE_ITEMS=$(echo "$FILTERED_ASSESSMENT" | grep -E "ACTIONABLE_(NOW|LATER)" || echo "")
-          if [ -n "$_ACTIONABLE_ITEMS" ]; then
-            # Get context around each actionable item to find severity
-            CRITICAL_COUNT=$(echo "$FILTERED_ASSESSMENT" | grep -E -B2 -A5 "ACTIONABLE_NOW|ACTIONABLE_LATER" | grep -c "Severity:.*CRITICAL" 2>/dev/null) || true
-            HIGH_COUNT=$(echo "$FILTERED_ASSESSMENT" | grep -E -B2 -A5 "ACTIONABLE_NOW|ACTIONABLE_LATER" | grep -c "Severity:.*HIGH" 2>/dev/null) || true
-            MEDIUM_COUNT=$(echo "$FILTERED_ASSESSMENT" | grep -E -B2 -A5 "ACTIONABLE_NOW|ACTIONABLE_LATER" | grep -c "Severity:.*MEDIUM" 2>/dev/null) || true
-            LOW_COUNT=$(echo "$FILTERED_ASSESSMENT" | grep -E -B2 -A5 "ACTIONABLE_NOW|ACTIONABLE_LATER" | grep -c "Severity:.*LOW" 2>/dev/null) || true
+          _ACTIONABLE_ITEMS=$(echo "$FILTERED_ASSESSMENT" | grep -c "^### .* - ACTIONABLE_\(NOW\|LATER\)" || true)
+          if [ "$_ACTIONABLE_ITEMS" -gt 0 ]; then
+            CRITICAL_COUNT=$(echo "$FILTERED_ASSESSMENT" | grep -A 5 "^### .* - ACTIONABLE_\(NOW\|LATER\)" | grep -c "Severity:.*CRITICAL" || true)
+            HIGH_COUNT=$(echo "$FILTERED_ASSESSMENT" | grep -A 5 "^### .* - ACTIONABLE_\(NOW\|LATER\)" | grep -c "Severity:.*HIGH" || true)
+            MEDIUM_COUNT=$(echo "$FILTERED_ASSESSMENT" | grep -A 5 "^### .* - ACTIONABLE_\(NOW\|LATER\)" | grep -c "Severity:.*MEDIUM" || true)
+            LOW_COUNT=$(echo "$FILTERED_ASSESSMENT" | grep -A 5 "^### .* - ACTIONABLE_\(NOW\|LATER\)" | grep -c "Severity:.*LOW" || true)
           fi
-          # Ensure numeric defaults
           CRITICAL_COUNT=${CRITICAL_COUNT:-0}
           HIGH_COUNT=${HIGH_COUNT:-0}
           MEDIUM_COUNT=${MEDIUM_COUNT:-0}

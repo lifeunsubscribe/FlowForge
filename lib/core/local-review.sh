@@ -25,29 +25,6 @@ if [ -z "${RITE_LIB_DIR:-}" ]; then
 fi
 source "$RITE_LIB_DIR/utils/colors.sh"
 
-# =============================================================================
-# CACHE INVALIDATION: Invalidate cached assessments when new review is posted
-# =============================================================================
-
-invalidate_pr_cache() {
-  local pr_num="$1"
-  local cache_dir="$RITE_PROJECT_ROOT/${RITE_ASSESSMENT_CACHE_DIR:-.rite/assessment-cache}"
-
-  if [ -d "$cache_dir" ]; then
-    # Remove any cached assessments tagged with this PR
-    local removed=0
-    while IFS= read -r meta; do
-      local base="${meta%.meta}"
-      rm -f "$base.json" "$meta" 2>/dev/null
-      ((removed++)) || true
-    done < <(find "$cache_dir" -name "*.meta" -exec grep -l "\"pr_number\": \"$pr_num\"" {} \; 2>/dev/null)
-
-    if [ "$removed" -gt 0 ]; then
-      print_info "Invalidated $removed cached assessments for PR #$pr_num"
-    fi
-  fi
-}
-
 # Parse arguments
 PR_NUMBER="${1:-}"
 POST_REVIEW=false
@@ -310,6 +287,10 @@ fi
 
 if [ -z "$REVIEW_OUTPUT" ]; then
   print_error "Claude returned empty review"
+  if [ -n "$CLAUDE_ERROR" ]; then
+    echo "stderr output:" >&2
+    echo "$CLAUDE_ERROR" >&2
+  fi
   exit 1
 fi
 
@@ -323,10 +304,21 @@ $REVIEW_OUTPUT"
 
 if [ "$POST_REVIEW" = true ]; then
   # Parse review to determine verdict
-  CRITICAL_COUNT=$(echo "$REVIEW_OUTPUT" | grep -ciE "^### CRITICAL|CRITICAL:|❌ CRITICAL" || echo "0")
-  HIGH_COUNT=$(echo "$REVIEW_OUTPUT" | grep -ciE "^### HIGH|HIGH:|⚠️ HIGH" || echo "0")
-  MEDIUM_COUNT=$(echo "$REVIEW_OUTPUT" | grep -ciE "^### MEDIUM|MEDIUM:|📋 MEDIUM" || echo "0")
-  LOW_COUNT=$(echo "$REVIEW_OUTPUT" | grep -ciE "^### LOW|LOW:|💡 LOW" || echo "0")
+  # Prefer the structured Findings line (e.g. "Findings: [CRITICAL: 0 | HIGH: 1 | ...]")
+  # to avoid matching severity keywords in metadata/reasoning text
+  FINDINGS_LINE=$(echo "$REVIEW_OUTPUT" | grep -oE "CRITICAL: [0-9]+ \| HIGH: [0-9]+ \| MEDIUM: [0-9]+ \| LOW: [0-9]+" | head -1 || true)
+  if [ -n "$FINDINGS_LINE" ]; then
+    CRITICAL_COUNT=$(echo "$FINDINGS_LINE" | grep -oE "CRITICAL: [0-9]+" | grep -oE "[0-9]+" || echo "0")
+    HIGH_COUNT=$(echo "$FINDINGS_LINE" | grep -oE "HIGH: [0-9]+" | grep -oE "[0-9]+" || echo "0")
+    MEDIUM_COUNT=$(echo "$FINDINGS_LINE" | grep -oE "MEDIUM: [0-9]+" | grep -oE "[0-9]+" || echo "0")
+    LOW_COUNT=$(echo "$FINDINGS_LINE" | grep -oE "LOW: [0-9]+" | grep -oE "[0-9]+" || echo "0")
+  else
+    # Fallback: count section headers (less reliable)
+    CRITICAL_COUNT=$(echo "$REVIEW_OUTPUT" | grep -ciE "^### .*critical|❌.*critical" || true)
+    HIGH_COUNT=$(echo "$REVIEW_OUTPUT" | grep -ciE "^### .*high|⚡.*high priority" || true)
+    MEDIUM_COUNT=$(echo "$REVIEW_OUTPUT" | grep -ciE "^### .*medium|📋.*medium priority" || true)
+    LOW_COUNT=$(echo "$REVIEW_OUTPUT" | grep -ciE "^### .*low|💡.*low|minor suggestion" || true)
+  fi
 
   # Check for explicit approval in review output
   HAS_APPROVE=$(echo "$REVIEW_OUTPUT" | grep -ciE "Overall.*APPROVE|Assessment.*APPROVE|\*\*APPROVE\*\*" || echo "0")
@@ -373,9 +365,6 @@ if [ "$POST_REVIEW" = true ]; then
   print_success "Review posted successfully!"
   echo "  Verdict: $VERDICT_LABEL"
   echo ""
-
-  # Invalidate cached assessments for this PR (new review = old assessment is stale)
-  invalidate_pr_cache "$PR_NUMBER"
 
   # Output summary
   echo "Review Summary:"

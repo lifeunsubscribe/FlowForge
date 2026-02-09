@@ -6,6 +6,7 @@
 #   rite <issue>              Process single issue (full lifecycle)
 #   rite <issue1> <issue2>    Process multiple issues (batch)
 #   rite <issue> --quick      Work + PR only, skip review/merge
+#   rite <issue> --undo       Undo workflow: close PR, clean up artifacts
 #   rite --followup           Auto-discover follow-up pairs
 #   rite --init               Initialize .rite/ in current project
 #   rite --dry-run <...>      Print execution plan without running
@@ -50,6 +51,10 @@ while [[ $# -gt 0 ]]; do
       MODE="quick"
       shift
       ;;
+    --undo)
+      MODE="undo"
+      shift
+      ;;
     --supervised)
       SUPERVISED=true
       WORKFLOW_FLAGS+=("--supervised")
@@ -89,6 +94,7 @@ while [[ $# -gt 0 ]]; do
       echo "  rite <issue> --supervised Process single issue (supervised, bypasses blockers)"
       echo "  rite <issue1> <issue2>    Process multiple issues (batch)"
       echo "  rite <issue> --quick      Work + PR only, skip review/merge"
+      echo "  rite <issue> --undo       Undo workflow: close PR, clean up artifacts"
       echo "  rite --followup           Security debt report + batch process"
       echo "  rite --init               Initialize .rite/ in current project"
       echo "  rite --dry-run <...>      Print execution plan without running"
@@ -107,6 +113,7 @@ while [[ $# -gt 0 ]]; do
       echo "  rite 21 --bypass-blockers # Unsupervised: bypass blockers, warn via Slack"
       echo "  rite 21 45                # Batch process issues"
       echo "  rite 21 --quick           # Quick mode: work + PR only"
+      echo "  rite 21 --undo            # Undo: close PR, clean branches/worktree/state"
       echo "  rite --followup           # Process tech-debt issues"
       echo "  rite 21 --dry-run         # See what would happen"
       echo ""
@@ -318,15 +325,17 @@ resolve_or_create_issue() {
   echo "$issue_number"
 }
 
-# Pre-flight: check Claude CLI is available
-if ! command -v claude &>/dev/null && ! command -v claude-code &>/dev/null; then
-  print_error "Claude CLI not found"
-  echo ""
-  echo "Sharkrite requires Claude Code to run workflows."
-  echo "Install it with: npm install -g @anthropic-ai/claude-code"
-  echo "Then authenticate: claude"
-  echo ""
-  exit 1
+# Pre-flight: check Claude CLI is available (not needed for --undo)
+if [ "$MODE" != "undo" ]; then
+  if ! command -v claude &>/dev/null && ! command -v claude-code &>/dev/null; then
+    print_error "Claude CLI not found"
+    echo ""
+    echo "Sharkrite requires Claude Code to run workflows."
+    echo "Install it with: npm install -g @anthropic-ai/claude-code"
+    echo "Then authenticate: claude"
+    echo ""
+    exit 1
+  fi
 fi
 
 # Pre-flight: check gh CLI and auth
@@ -372,6 +381,14 @@ elif [ ${#ARGS[@]} -eq 1 ] && [ "$MODE" = "quick" ]; then
   "$RITE_LIB_DIR/core/create-pr.sh" --auto
   print_success "Quick mode complete — PR created, skipping review/merge"
   exit 0
+elif [ "$MODE" = "undo" ] && [ ${#ARGS[@]} -ne 1 ]; then
+  print_error "--undo requires exactly one issue number"
+  echo "Usage: rite <issue> --undo"
+  exit 1
+elif [ ${#ARGS[@]} -eq 1 ] && [ "$MODE" = "undo" ]; then
+  # Undo mode: close PR, clean up all workflow artifacts
+  ISSUE_NUMBER=$(resolve_or_create_issue "${ARGS[0]}")
+  exec "$RITE_LIB_DIR/core/undo-workflow.sh" "$ISSUE_NUMBER"
 elif [ ${#ARGS[@]} -gt 1 ] || [ -n "$FILTER" ]; then
   # Batch mode
   print_info "Batch processing ${#ARGS[@]} issues"

@@ -16,6 +16,6 @@ node_modules/
 *.log
 tmp/
 
-# Local development state (worktree symlinks)
-.rite/
-.claude/
+# Local development state (no trailing slash — matches both dirs and symlinks in worktrees)
+.rite
+.claude

@@ -297,8 +297,11 @@ $(echo "$REVIEW_CONTENT" | sed -n '/^## .*[Ll]ow/,/^##[^#]/p')
 "
   fi
 
-  # Both modes now auto-complete (stdin piping, no interactive session)
-  EXIT_INSTRUCTION="Session will end automatically when you finish making all fixes."
+  if [ "$AUTO_MODE" = true ]; then
+    EXIT_INSTRUCTION="Session will end automatically when you finish making all fixes."
+  else
+    EXIT_INSTRUCTION="Exit the session when you have finished making all fixes."
+  fi
 
   FIX_PROMPT+="## Instructions
 
@@ -354,27 +357,27 @@ $EXIT_INSTRUCTION"
       print_warning "Claude exited with code $FIX_EXIT_CODE - checking for changes..."
     fi
   else
-    # Supervised mode: user watches output, longer timeout
-    # Note: We use --print mode (like auto) because stdin piping breaks interactive TTY.
-    # The "supervised" aspect is the longer timeout and user watching output.
+    # Supervised mode: interactive session — user approves tool calls and exits manually.
+    # Pass prompt as command-line argument (not stdin) to preserve TTY for interactivity.
     SUPERVISED_TIMEOUT=${RITE_SUPERVISED_TIMEOUT:-3600}  # Default 1 hour
-    print_info "Supervised mode: Running fixes (timeout: ${SUPERVISED_TIMEOUT}s)"
+    print_info "Supervised mode: Interactive fix session (timeout: ${SUPERVISED_TIMEOUT}s)"
     print_info "Tool restrictions active: gh, curl, wget blocked"
+    print_info "Exit the session when fixes are complete."
+
+    rm -f "$FIX_PROMPT_FILE"
 
     set +e
     if command -v gtimeout >/dev/null 2>&1; then
-      gtimeout "$SUPERVISED_TIMEOUT" $CLAUDE_CMD --print --dangerously-skip-permissions --disallowedTools "$DISALLOWED_TOOLS" < "$FIX_PROMPT_FILE"
+      gtimeout "$SUPERVISED_TIMEOUT" $CLAUDE_CMD --disallowedTools "$DISALLOWED_TOOLS" "$FIX_PROMPT"
       FIX_EXIT_CODE=$?
     elif command -v timeout >/dev/null 2>&1; then
-      timeout "$SUPERVISED_TIMEOUT" $CLAUDE_CMD --print --dangerously-skip-permissions --disallowedTools "$DISALLOWED_TOOLS" < "$FIX_PROMPT_FILE"
+      timeout "$SUPERVISED_TIMEOUT" $CLAUDE_CMD --disallowedTools "$DISALLOWED_TOOLS" "$FIX_PROMPT"
       FIX_EXIT_CODE=$?
     else
-      $CLAUDE_CMD --print --dangerously-skip-permissions --disallowedTools "$DISALLOWED_TOOLS" < "$FIX_PROMPT_FILE"
+      $CLAUDE_CMD --disallowedTools "$DISALLOWED_TOOLS" "$FIX_PROMPT"
       FIX_EXIT_CODE=$?
     fi
     set -e
-
-    rm -f "$FIX_PROMPT_FILE"
 
     if [ "${FIX_EXIT_CODE:-0}" -eq 124 ]; then
       print_warning "Supervised session timed out after ${SUPERVISED_TIMEOUT}s"
@@ -952,6 +955,36 @@ If the changes are unrelated work, answer UNRELATED."
 
     print_success "Worktree ready"
 
+    # Add symlink patterns to .gitignore BEFORE creating symlinks
+    # This prevents them from ever appearing as untracked files in git status
+    ensure_symlinks_gitignored() {
+      local gitignore="$WORKTREE_PATH/.gitignore"
+      # No trailing slashes — "foo/" only matches directories, but symlinks are
+      # files (mode 120000) so "foo/" won't match them. "foo" matches both.
+      local patterns=(".rite" ".claude" "node_modules" "backend/node_modules")
+      local updated=0
+
+      for pattern in "${patterns[@]}"; do
+        # Already has the correct (no-slash) entry — nothing to do
+        if [ -f "$gitignore" ] && grep -qxF "$pattern" "$gitignore" 2>/dev/null; then
+          continue
+        fi
+        # Has the old trailing-slash form that doesn't match symlinks — upgrade it
+        if [ -f "$gitignore" ] && grep -qxF "${pattern}/" "$gitignore" 2>/dev/null; then
+          sed -i '' "s|^${pattern}/$|${pattern}|" "$gitignore"
+          ((updated++)) || true
+          continue
+        fi
+        echo "$pattern" >> "$gitignore"
+        ((updated++)) || true
+      done
+
+      if [ "$updated" -gt 0 ]; then
+        print_info "Updated $updated symlink pattern(s) in .gitignore"
+      fi
+    }
+    ensure_symlinks_gitignored
+
     # Symlink node_modules to save disk space (if project has them)
     if [ -d "$MAIN_WORKTREE/node_modules" ]; then
       print_info "Symlinking node_modules from main worktree..."
@@ -984,34 +1017,6 @@ If the changes are unrelated work, answer UNRELATED."
       ln -s "$MAIN_WORKTREE/.claude" "$WORKTREE_PATH/.claude"
     fi
 
-    # Ensure worktree symlinks are in target repo's gitignore
-    # This prevents them from showing up as untracked files
-    ensure_symlinks_gitignored() {
-      local gitignore="$WORKTREE_PATH/.gitignore"
-      local patterns=(".rite/" ".claude/" "node_modules/" "backend/node_modules/")
-      local added=0
-
-      for pattern in "${patterns[@]}"; do
-        # Check if pattern exists in gitignore (accounting for leading slash or not)
-        local check_pattern="${pattern%/}"  # Remove trailing slash for grep
-        if [ -f "$gitignore" ] && grep -qE "^/?${check_pattern}/?$" "$gitignore" 2>/dev/null; then
-          continue  # Already ignored
-        fi
-
-        # Only add if the symlink actually exists
-        local check_path="$WORKTREE_PATH/${check_pattern}"
-        if [ -L "$check_path" ] || [ -d "$check_path" ]; then
-          echo "$pattern" >> "$gitignore"
-          ((added++)) || true
-        fi
-      done
-
-      if [ "$added" -gt 0 ]; then
-        print_info "Added $added symlink pattern(s) to .gitignore"
-      fi
-    }
-    ensure_symlinks_gitignored
-
     # Switch to worktree directory
     cd "$WORKTREE_PATH"
     print_success "Switched to worktree: $WORKTREE_PATH"
@@ -1033,6 +1038,17 @@ If the changes are unrelated work, answer UNRELATED."
       fi
     fi
 fi
+
+# Ensure symlink patterns in .gitignore don't use trailing slashes.
+# "foo/" only matches directories, but symlinks are files (mode 120000).
+# This runs on ALL paths (new worktree + continuation) to fix existing worktrees.
+for _pattern in ".rite" ".claude" "node_modules" "backend/node_modules"; do
+  if [ -f .gitignore ] && grep -qxF "${_pattern}/" .gitignore 2>/dev/null; then
+    if ! grep -qxF "$_pattern" .gitignore 2>/dev/null; then
+      sed -i '' "s|^${_pattern}/$|${_pattern}|" .gitignore
+    fi
+  fi
+done
 
 # Check git status
 print_header "📊 Repository Status"
@@ -1080,7 +1096,12 @@ else
   fi
 
   # Push to create remote branch
-  git push -u origin "$BRANCH_NAME" 2>/dev/null || true
+  if ! git push -u origin "$BRANCH_NAME" 2>/dev/null; then
+    # Stale remote branch from a previous undo'd run — delete it, then push normally
+    print_warning "Remote branch has stale history — deleting and re-pushing"
+    git push origin --delete "$BRANCH_NAME" 2>/dev/null || true
+    git push -u origin "$BRANCH_NAME" 2>/dev/null || true
+  fi
 
   # Create draft PR
   PR_TITLE="$ISSUE_DESC"
@@ -1211,10 +1232,7 @@ if [ "$AUTO_MODE" = true ]; then
   AUTO_MODE_INSTRUCTION="Proceed directly to implementation (auto mode - no approval needed)"
   AUTO_MODE_FINAL_NOTE="**Auto Mode**: Complete all phases automatically. After Phase 5:
 1. Provide a brief summary of what you implemented
-2. **IMPORTANT: Exit the session immediately** by typing \`/quit\` or \`/exit\`
-3. The post-workflow script will automatically handle commit, push, and PR creation
-
-**You must exit after completing Phase 5 for the automation to continue!**"
+2. The post-workflow script will automatically handle commit, push, and PR creation"
 else
   AUTO_MODE_INSTRUCTION="Wait for my approval before implementing"
   AUTO_MODE_FINAL_NOTE="After Phase 4, I'll review and we'll commit together."
@@ -1232,7 +1250,7 @@ Before starting, create a todo list with these items:
 3. Phase 2: Planning - Designing the implementation approach
 4. Phase 3: Implementation - Writing the code
 5. Phase 4: Testing & Validation - Running tests and verifying correctness
-6. Phase 5: Documentation - Updating docs and comments
+6. Phase 5: Code Comments - Adding inline comments for complex logic
 
 Mark each phase as 'in_progress' when you start it, and 'completed' when finished.
 For complex phases, break them into sub-tasks.
@@ -1283,10 +1301,9 @@ ${PHASE_0_INSTRUCTIONS}
 3. Verify code builds: npm run build
 4. Check for linting issues
 
-### Phase 5: Documentation
-1. Update relevant documentation
-2. Add comments to complex code
-3. Update CHANGELOG if applicable
+### Phase 5: Code Comments
+1. Add inline comments and JSDoc/TSDoc for complex logic only
+2. Do NOT update files in docs/, README, or CHANGELOG — those are handled by a separate review phase
 
 **Remember**: Update your todo list as you complete each phase. Mark the current phase as 'in_progress' and completed phases as 'completed'.
 
@@ -1335,11 +1352,36 @@ else
   CLAUDE_EXIT_CODE=0
 
   if [ "$AUTO_MODE" = true ]; then
-    # Auto mode: bypass permissions for unattended execution
+    # Auto mode: --print for auto-exit, stream-json for real-time tool visibility.
+    # --print with default text format only shows assistant text — tool calls (edits,
+    # bash commands) are invisible. stream-json streams ALL events; jq formats them.
+    CLAUDE_STREAM_ARGS="--print --dangerously-skip-permissions --output-format stream-json"
     if [ -n "$TIMEOUT_CMD" ]; then
-      $TIMEOUT_CMD "${CLAUDE_TIMEOUT}" $CLAUDE_CMD --permission-mode bypassPermissions "$CLAUDE_PROMPT" || CLAUDE_EXIT_CODE=$?
+      $TIMEOUT_CMD "${CLAUDE_TIMEOUT}" $CLAUDE_CMD $CLAUDE_STREAM_ARGS "$CLAUDE_PROMPT" 2>/dev/null | \
+        jq --unbuffered -rj '
+          if .type == "assistant" then
+            (.message.content[]? |
+              if .type == "text" then .text
+              elif .type == "tool_use" then "\n⚡ " + .name + "\n"
+              else empty end)
+          elif .type == "result" then
+            .result // empty
+          else empty end
+        ' 2>/dev/null || true
+      CLAUDE_EXIT_CODE=${PIPESTATUS[0]}
     else
-      $CLAUDE_CMD --permission-mode bypassPermissions "$CLAUDE_PROMPT" || CLAUDE_EXIT_CODE=$?
+      $CLAUDE_CMD $CLAUDE_STREAM_ARGS "$CLAUDE_PROMPT" 2>/dev/null | \
+        jq --unbuffered -rj '
+          if .type == "assistant" then
+            (.message.content[]? |
+              if .type == "text" then .text
+              elif .type == "tool_use" then "\n⚡ " + .name + "\n"
+              else empty end)
+          elif .type == "result" then
+            .result // empty
+          else empty end
+        ' 2>/dev/null || true
+      CLAUDE_EXIT_CODE=${PIPESTATUS[0]}
     fi
   else
     # Supervised mode: interactive with approval prompts
@@ -1600,14 +1642,9 @@ else
 fi
 
 # Push with upstream tracking
-if [ "$AUTO_MODE" = true ]; then
-  git push -u origin "$BRANCH_NAME" 2>&1 | grep -E "(Writing objects|remote:)" || true
-  echo "✅ Pushed to origin/$BRANCH_NAME"
-else
-  git push -u origin "$BRANCH_NAME"
-  print_success "Pushed to origin/$BRANCH_NAME"
-  echo ""
-fi
+git push -u origin "$BRANCH_NAME"
+print_success "Pushed to origin/$BRANCH_NAME"
+echo ""
 fi  # End of "if CHANGES_COUNT > 0" block
 fi  # End of "if SKIP_TO_PR" block
 

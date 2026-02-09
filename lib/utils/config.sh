@@ -99,9 +99,6 @@ RITE_CLAUDE_MODEL="${RITE_CLAUDE_MODEL:-}"
 # Review and assessment MUST use same model for consistency
 RITE_REVIEW_MODEL="${RITE_REVIEW_MODEL:-opus}"
 
-# Assessment cache directory (stores cached assessments by review hash)
-RITE_ASSESSMENT_CACHE_DIR="${RITE_ASSESSMENT_CACHE_DIR:-$RITE_DATA_DIR/assessment-cache}"
-
 # Review method: "app" | "local" | "auto" (default: local)
 #   - "app": Use Claude for GitHub app only (fail if not installed)
 #   - "local": Use local Sharkrite review only (never wait for app)
@@ -172,7 +169,6 @@ export SESSION_STATE_FILE
 export RITE_CLAUDE_TIMEOUT
 export RITE_CLAUDE_MODEL
 export RITE_REVIEW_MODEL
-export RITE_ASSESSMENT_CACHE_DIR
 export RITE_REVIEW_METHOD
 export RITE_DRY_RUN
 export SKIP_AWS_CHECK
@@ -189,7 +185,6 @@ export BLOCKER_EXPENSIVE_SERVICES
 
 if [ "$RITE_DRY_RUN" != "true" ]; then
   mkdir -p "$RITE_PROJECT_ROOT/$RITE_DATA_DIR"
-  mkdir -p "$RITE_PROJECT_ROOT/$RITE_ASSESSMENT_CACHE_DIR"
   mkdir -p "$RITE_WORKTREE_DIR"
 
   # Create .rite/.gitignore if it doesn't exist
