@@ -1,8 +1,8 @@
-# Forge
+# Sharkrite
 
 **AI-powered GitHub workflow automation CLI — process issues end-to-end with Claude Code**
 
-Forge automates the full lifecycle of GitHub issue development: branch creation, Claude Code development, PR creation, review assessment, fix loops, and merge — with intelligent blocker detection and security feedback loops.
+Sharkrite automates the full lifecycle of GitHub issue development: branch creation, Claude Code development, PR creation, review assessment, fix loops, and merge — with intelligent blocker detection and security feedback loops.
 
 ---
 
@@ -16,7 +16,7 @@ cd /tmp/rite-install
 ./install.sh
 ```
 
-This installs to `~/.rite/` and symlinks `forge` into `~/.local/bin/`.
+This installs to `~/.rite/` and symlinks `rite` into `~/.local/bin/`.
 
 ### Prerequisites
 
@@ -97,7 +97,7 @@ Issue #21 → workflow-runner.sh
 
 ## Configuration
 
-Forge uses a layered config system:
+Sharkrite uses a layered config system:
 
 ```
 Defaults → ~/.config/rite/config (global) → .rite/config (project) → Environment variables
@@ -128,7 +128,7 @@ Settings that apply across all projects:
 ```bash
 # Notifications
 SLACK_WEBHOOK_URL="https://hooks.slack.com/..."
-RITE_EMAIL_FROM="forge@example.com"
+RITE_EMAIL_FROM="sharkrite@example.com"
 
 # AWS profile for notifications
 RITE_AWS_PROFILE="default"
@@ -153,7 +153,7 @@ See [config/blockers.conf.example](config/blockers.conf.example) for all pattern
 Control how Claude assesses PR review issues:
 
 1. **`.rite/assessment-prompt.md`** — Full custom assessment prompt (highest priority)
-2. **`CLAUDE.md`** — Forge extracts security/conventions sections automatically
+2. **`CLAUDE.md`** — Sharkrite extracts security/conventions sections automatically
 3. **Generic fallback** — Built-in assessment criteria from `templates/assessment-prompt.md`
 
 ---
@@ -161,7 +161,7 @@ Control how Claude assesses PR review issues:
 ## Project Structure
 
 ```
-forge/
+sharkrite/
 ├── bin/rite                        # CLI entry point
 ├── lib/
 │   ├── core/                        # Core workflow scripts
@@ -186,7 +186,7 @@ forge/
 │       ├── cleanup-worktrees.sh    # Worktree cleanup utility
 │       └── validate-setup.sh       # Prerequisites validator
 ├── config/                          # Example configurations
-│   ├── forge.conf.example          # Global config template
+│   ├── rite.conf.example          # Global config template
 │   ├── project.conf.example        # Per-project config template
 │   └── blockers.conf.example       # Blocker patterns template
 ├── templates/                       # Templates for rite --init

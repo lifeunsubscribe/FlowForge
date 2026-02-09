@@ -3,9 +3,9 @@
 # Unified workflow entry point - handles all modes of starting/continuing work
 #
 # Usage Examples:
-#   forge 19                            # From GitHub issue (supervised)
-#   forge 19 --quick                    # From GitHub issue (unsupervised)
-#   forge "add oauth"                   # From description (supervised)
+#   rite 19                            # From GitHub issue (supervised)
+#   rite 19 --quick                    # From GitHub issue (unsupervised)
+#   rite "add oauth"                   # From description (supervised)
 #   rite --continue                    # Continue work on existing branch
 #
 # Features:
@@ -969,7 +969,7 @@ If the changes are unrelated work, answer UNRELATED."
       print_success "node_modules symlinked"
     fi
 
-    # Symlink forge data dir to share scratchpad and context across worktrees
+    # Symlink rite data dir to share scratchpad and context across worktrees
     RITE_DATA_PATH="$MAIN_WORKTREE/$RITE_DATA_DIR"
     if [ -d "$RITE_DATA_PATH" ]; then
       print_info "Symlinking $RITE_DATA_DIR directory for shared scratchpad..."

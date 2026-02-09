@@ -1204,7 +1204,7 @@ main() {
   local issue_number="$1"
   shift
 
-  # Validate issue number is a positive integer (text descriptions should be resolved by bin/forge)
+  # Validate issue number is a positive integer (text descriptions should be resolved by bin/rite)
   if ! [[ "$issue_number" =~ ^[0-9]+$ ]] || [ "$issue_number" -le 0 ] 2>/dev/null; then
     print_error "Invalid issue number: $issue_number (must be positive integer)"
     print_info "Hint: rite accepts text descriptions — they get auto-created as GitHub issues"

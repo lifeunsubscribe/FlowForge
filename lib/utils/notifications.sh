@@ -29,7 +29,7 @@ send_slack() {
 
   local payload=$(cat <<EOF
 {
-  "text": "${icon} ${RITE_PROJECT_NAME:-Forge} Workflow",
+  "text": "${icon} ${RITE_PROJECT_NAME:-Sharkrite} Workflow",
   "blocks": [
     {
       "type": "section",

@@ -398,16 +398,16 @@ ACTIONABLE_NOW - Fix in this PR cycle:
   - HIGH bugs that would break the feature being implemented
   - Issues that make the PR UNMERGEABLE (build fails, tests fail)
   - Any valid concern WITHIN the original issue scope
-  - Quick fixes (<10min) that a reasonable engineer would include
+  - Quick fixes (<30min) that a reasonable engineer would include
+  - Logical completions of the work (e.g., if fixing regex, also fix related validation)
+  - Changes in the SAME file/module that are directly related
 
 ACTIONABLE_LATER - Valid concern, create follow-up issue:
-  - Issues OUTSIDE the original issue scope (scope creep)
-  - Large refactors requiring architectural changes (>1 hour)
-  - Changes that touch unrelated code/systems
-  - Breaking changes affecting existing users (e.g., API changes, validation rule changes)
-  - Multi-file changes that would warrant their own PR review cycle
-  - Improvements that need their own focused PR
-  - Test coverage gaps in code NOT directly related to the issue
+  - Changes to UNRELATED systems or modules (different domain entirely)
+  - Large refactors requiring NEW architectural patterns (>2 hours)
+  - Breaking changes to PUBLIC APIs affecting external consumers
+  - Work requiring NEW dependencies or significant infrastructure changes
+  - Items that need design discussion or team consensus first
 
 DISMISSED - Not worth tracking:
   - Pure style preferences (no functional impact)
@@ -417,6 +417,7 @@ DISMISSED - Not worth tracking:
   - Already documented as accepted patterns
   - \"Nice to have\" without clear, immediate benefit
   - LOW priority items that don't affect functionality
+  - Items already covered by ACTIONABLE_NOW (avoid duplicates)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 OUTPUT FORMAT:
@@ -455,17 +456,17 @@ ACTIONABLE_NOW (fix now) IF:
   - Security vulnerability (CRITICAL always, HIGH if exploitable)
   - Bug that breaks the feature being implemented
   - Valid concern WITHIN the original issue scope
-  - Quick fix (<10min) that a reasonable engineer would include
+  - Quick fix (<30min) that a reasonable engineer would include
   - Build or test failure
+  - Logical completion of the work being done (same domain)
+  - Changes in the SAME module that are directly related
 
 ACTIONABLE_LATER (defer to tech-debt) IF:
-  - Valid concern but OUTSIDE original issue scope
-  - Large refactor requiring >1 hour of work
-  - Touches unrelated code or systems
-  - Breaking changes that affect existing users or APIs
-  - Multi-file changes spanning unrelated modules (warrant own PR cycle)
-  - Requires design discussion or new dependencies
-  - Would need its own test suite or documentation update
+  - Changes to UNRELATED systems (different module/domain entirely)
+  - Large refactor requiring >2 hours AND new architectural patterns
+  - Breaking changes to PUBLIC APIs affecting external consumers
+  - Requires NEW dependencies or significant infrastructure changes
+  - Needs design discussion or team consensus before implementing
 
 DISMISSED (not worth tracking) IF:
   - Pure style preference with no functional benefit
@@ -474,6 +475,7 @@ DISMISSED (not worth tracking) IF:
   - Already documented as intentional
   - LOW priority with no clear benefit
   - Unrelated to files being modified
+  - Duplicates an item already classified as ACTIONABLE_NOW
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -671,13 +673,6 @@ fi
 
 print_success "Assessment complete"
 
-# Cache successful result for future determinism
-save_to_cache "$CACHE_KEY" "$ASSESSMENT_OUTPUT" "$EFFECTIVE_MODEL"
-
-# Also save as "previous" assessment for cross-iteration determinism
-# This ensures the next iteration (after fixes) can defer to these classifications
-save_as_previous_assessment "$PR_NUMBER" "$ASSESSMENT_OUTPUT"
-
 # Parse assessment to check for actionable items (NOW or LATER)
 ACTIONABLE_NOW_ITEMS=$(echo "$ASSESSMENT_OUTPUT" | grep "ACTIONABLE_NOW" || echo "")
 ACTIONABLE_LATER_ITEMS=$(echo "$ASSESSMENT_OUTPUT" | grep "ACTIONABLE_LATER" || echo "")
@@ -685,11 +680,218 @@ ACTIONABLE_LATER_ITEMS=$(echo "$ASSESSMENT_OUTPUT" | grep "ACTIONABLE_LATER" || 
 # Count each type for reporting
 ACTIONABLE_NOW_COUNT=$(echo "$ACTIONABLE_NOW_ITEMS" | grep -c "ACTIONABLE_NOW" 2>/dev/null || echo "0")
 ACTIONABLE_LATER_COUNT=$(echo "$ACTIONABLE_LATER_ITEMS" | grep -c "ACTIONABLE_LATER" 2>/dev/null || echo "0")
+DISMISSED_COUNT=$(echo "$ASSESSMENT_OUTPUT" | grep -c "DISMISSED" 2>/dev/null || echo "0")
 
 if [ -z "$ACTIONABLE_NOW_ITEMS" ] && [ -z "$ACTIONABLE_LATER_ITEMS" ]; then
   print_info "No actionable items found (all dismissed or clean review)"
 else
-  print_info "Found: $ACTIONABLE_NOW_COUNT items for immediate action, $ACTIONABLE_LATER_COUNT for later"
+  print_info "Found: $ACTIONABLE_NOW_COUNT NOW, $ACTIONABLE_LATER_COUNT LATER, $DISMISSED_COUNT DISMISSED"
+fi
+
+# =============================================================================
+# POST ASSESSMENT AS PR COMMENT (instead of just cache files)
+# =============================================================================
+
+# Build assessment summary for PR comment
+ASSESSMENT_TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+ASSESSMENT_COMMENT="<!-- sharkrite-assessment pr:${PR_NUMBER} iteration:1 timestamp:${ASSESSMENT_TIMESTAMP} -->
+
+## 🔍 Sharkrite Assessment
+
+**PR:** #${PR_NUMBER}
+**Assessed:** ${ASSESSMENT_TIMESTAMP}
+**Model:** ${EFFECTIVE_MODEL}
+
+### Summary
+- **ACTIONABLE_NOW:** ${ACTIONABLE_NOW_COUNT} items (fix in this PR)
+- **ACTIONABLE_LATER:** ${ACTIONABLE_LATER_COUNT} items (tech-debt)
+- **DISMISSED:** ${DISMISSED_COUNT} items (not actionable)
+
+---
+
+${ASSESSMENT_OUTPUT}"
+
+# Post assessment as PR comment
+print_info "Posting assessment to PR #$PR_NUMBER..."
+if gh pr comment "$PR_NUMBER" --body "$ASSESSMENT_COMMENT" >/dev/null 2>&1; then
+  print_success "Assessment posted to PR"
+else
+  print_warning "Failed to post assessment comment (continuing anyway)"
+fi
+
+# =============================================================================
+# CREATE/UPDATE TECH-DEBT ISSUES FOR ACTIONABLE_LATER ITEMS
+# =============================================================================
+
+if [ "$ACTIONABLE_LATER_COUNT" -gt 0 ]; then
+  print_info "Processing $ACTIONABLE_LATER_COUNT ACTIONABLE_LATER items..."
+
+  # Get existing open tech-debt issues to check for duplicates
+  EXISTING_ISSUES=$(gh issue list --state open --label "tech-debt" --json number,title --jq '.[] | "\(.number):\(.title)"' 2>/dev/null || echo "")
+
+  # Also check for issues already linked to this PR
+  PR_LINKED_ISSUES=$(gh pr view "$PR_NUMBER" --json body --jq '.body' 2>/dev/null | grep -oE "Follow-up.*#[0-9]+" | grep -oE "#[0-9]+" || echo "")
+
+  # Parse each ACTIONABLE_LATER item and create/update issues
+  CREATED_ISSUES=""
+  UPDATED_ISSUES=""
+
+  # Extract ACTIONABLE_LATER sections from assessment
+  echo "$ASSESSMENT_OUTPUT" | awk '
+    /^### .* - ACTIONABLE_LATER$/ {
+      in_later = 1
+      title = $0
+      gsub(/^### /, "", title)
+      gsub(/ - ACTIONABLE_LATER$/, "", title)
+      print "TITLE:" title
+    }
+    in_later && /^\*\*Severity:\*\*/ { print $0 }
+    in_later && /^\*\*Category:\*\*/ { print $0 }
+    in_later && /^\*\*Reasoning:\*\*/ { print $0 }
+    in_later && /^\*\*Context:\*\*/ { print $0 }
+    in_later && /^\*\*Defer Reason:\*\*/ { print $0; print "---END---"; in_later = 0 }
+    in_later && /^### / && !/ACTIONABLE_LATER/ { print "---END---"; in_later = 0 }
+  ' | while read -r line; do
+    case "$line" in
+      TITLE:*)
+        ITEM_TITLE="${line#TITLE:}"
+        ITEM_SEVERITY=""
+        ITEM_CATEGORY=""
+        ITEM_REASONING=""
+        ITEM_CONTEXT=""
+        ITEM_DEFER=""
+        ;;
+      \*\*Severity:\*\**)
+        ITEM_SEVERITY="${line#\*\*Severity:\*\* }"
+        ;;
+      \*\*Category:\*\**)
+        ITEM_CATEGORY="${line#\*\*Category:\*\* }"
+        ;;
+      \*\*Reasoning:\*\**)
+        ITEM_REASONING="${line#\*\*Reasoning:\*\* }"
+        ;;
+      \*\*Context:\*\**)
+        ITEM_CONTEXT="${line#\*\*Context:\*\* }"
+        ;;
+      \*\*Defer\ Reason:\*\**)
+        ITEM_DEFER="${line#\*\*Defer Reason:\*\* }"
+        ;;
+      ---END---)
+        # Check for duplicate by fuzzy matching title
+        DUPLICATE_ISSUE=""
+        if [ -n "$EXISTING_ISSUES" ]; then
+          # Simple fuzzy match: check if any existing issue title contains key words from this title
+          TITLE_WORDS=$(echo "$ITEM_TITLE" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' ' ')
+          while IFS=: read -r issue_num issue_title; do
+            EXISTING_WORDS=$(echo "$issue_title" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' ' ')
+            # Count matching words
+            MATCH_COUNT=0
+            for word in $TITLE_WORDS; do
+              if [ ${#word} -gt 3 ] && echo "$EXISTING_WORDS" | grep -qw "$word"; then
+                MATCH_COUNT=$((MATCH_COUNT + 1))
+              fi
+            done
+            # If more than 2 significant words match, consider it a duplicate
+            if [ "$MATCH_COUNT" -ge 2 ]; then
+              DUPLICATE_ISSUE="$issue_num"
+              break
+            fi
+          done <<< "$EXISTING_ISSUES"
+        fi
+
+        if [ -n "$DUPLICATE_ISSUE" ]; then
+          # Update existing issue with new context
+          print_info "  Updating existing issue #$DUPLICATE_ISSUE: $ITEM_TITLE"
+          UPDATE_COMMENT="## Additional Context from PR #${PR_NUMBER}
+
+**Severity:** ${ITEM_SEVERITY}
+**Reasoning:** ${ITEM_REASONING}
+**Context:** ${ITEM_CONTEXT}
+**Defer Reason:** ${ITEM_DEFER}
+
+_Added by Sharkrite assessment on ${ASSESSMENT_TIMESTAMP}_"
+
+          gh issue comment "$DUPLICATE_ISSUE" --body "$UPDATE_COMMENT" >/dev/null 2>&1 && \
+            UPDATED_ISSUES="${UPDATED_ISSUES}#${DUPLICATE_ISSUE} "
+        else
+          # Create new issue
+          print_info "  Creating issue: $ITEM_TITLE"
+          ISSUE_BODY="## From PR #${PR_NUMBER} Assessment
+
+**Severity:** ${ITEM_SEVERITY}
+**Category:** ${ITEM_CATEGORY}
+
+## Issue
+${ITEM_REASONING}
+
+## Context
+${ITEM_CONTEXT}
+
+## Defer Reason
+${ITEM_DEFER}
+
+---
+_Created by Sharkrite assessment on ${ASSESSMENT_TIMESTAMP}_
+_Parent PR: #${PR_NUMBER}_"
+
+          NEW_ISSUE=$(gh issue create \
+            --title "$ITEM_TITLE" \
+            --body "$ISSUE_BODY" \
+            --label "tech-debt" \
+            --label "from-review" \
+            --json number --jq '.number' 2>/dev/null)
+
+          if [ -n "$NEW_ISSUE" ]; then
+            CREATED_ISSUES="${CREATED_ISSUES}#${NEW_ISSUE} "
+            print_success "  Created issue #$NEW_ISSUE"
+          fi
+        fi
+        ;;
+    esac
+  done
+
+  # Update PR body with follow-up issue links
+  if [ -n "$CREATED_ISSUES" ] || [ -n "$UPDATED_ISSUES" ]; then
+    print_info "Updating PR body with follow-up issue links..."
+
+    CURRENT_BODY=$(gh pr view "$PR_NUMBER" --json body --jq '.body' 2>/dev/null)
+
+    # Check if follow-up section already exists
+    if echo "$CURRENT_BODY" | grep -q "## Follow-up Issues"; then
+      # Append to existing section
+      NEW_ISSUES_LINE=""
+      [ -n "$CREATED_ISSUES" ] && NEW_ISSUES_LINE="Created: ${CREATED_ISSUES}"
+      [ -n "$UPDATED_ISSUES" ] && NEW_ISSUES_LINE="${NEW_ISSUES_LINE} Updated: ${UPDATED_ISSUES}"
+
+      UPDATED_BODY=$(echo "$CURRENT_BODY" | sed "/## Follow-up Issues/a\\
+${NEW_ISSUES_LINE}")
+    else
+      # Add new section
+      UPDATED_BODY="${CURRENT_BODY}
+
+---
+
+## Follow-up Issues
+
+**From assessment on ${ASSESSMENT_TIMESTAMP}:**
+- Created: ${CREATED_ISSUES:-none}
+- Updated: ${UPDATED_ISSUES:-none}"
+    fi
+
+    gh pr edit "$PR_NUMBER" --body "$UPDATED_BODY" >/dev/null 2>&1 && \
+      print_success "PR body updated with follow-up links" || \
+      print_warning "Failed to update PR body"
+  fi
+fi
+
+# =============================================================================
+# LEGACY: Still save to cache for local performance (optional)
+# =============================================================================
+
+# Cache successful result for future determinism (can be disabled if PR comments are preferred)
+if [ "${RITE_DISABLE_ASSESSMENT_CACHE:-false}" != "true" ]; then
+  save_to_cache "$CACHE_KEY" "$ASSESSMENT_OUTPUT" "$EFFECTIVE_MODEL"
+  save_as_previous_assessment "$PR_NUMBER" "$ASSESSMENT_OUTPUT"
 fi
 
 # ALWAYS output the full annotated assessment to stdout (includes all three states: NOW, LATER, DISMISSED)

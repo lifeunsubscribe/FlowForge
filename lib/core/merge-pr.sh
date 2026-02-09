@@ -2,8 +2,8 @@
 # merge-pr.sh
 # Complete PR merge workflow with validation
 # Usage:
-#   forge merge <pr-number>   # Merge specific PR
-#   forge merge               # Merge PR for current branch
+#   rite merge <pr-number>   # Merge specific PR
+#   rite merge               # Merge PR for current branch
 #
 # Optional Environment Variables:
 #   SLACK_WEBHOOK - Slack webhook URL for deep clean notifications
@@ -11,7 +11,7 @@
 
 set -e
 
-# Source forge configuration
+# Source configuration
 _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -z "${RITE_LIB_DIR:-}" ]; then
   source "$_SCRIPT_DIR/../utils/config.sh"
@@ -357,8 +357,8 @@ if [ -z "$PR_NUMBER" ]; then
     print_error "No PR found for branch: $CURRENT_BRANCH"
     echo ""
     echo "Usage:"
-    echo "  forge merge <pr-number>  # Merge specific PR"
-    echo "  forge merge              # Merge PR for current branch (must have existing PR)"
+    echo "  rite merge <pr-number>  # Merge specific PR"
+    echo "  rite merge              # Merge PR for current branch (must have existing PR)"
     exit 1
   fi
 
@@ -416,12 +416,10 @@ elif [ "$AUTO_MODE" = false ]; then
   print_success "PR is open"
 fi
 
-# Check 2: PR must not be a draft
+# Check 2: PR must not be a draft (only show error, not success - it's expected)
 if [ "$PR_IS_DRAFT" = "true" ]; then
   print_error "PR is still in draft state"
   VALIDATION_FAILED=true
-elif [ "$AUTO_MODE" = false ]; then
-  print_success "PR is not a draft"
 fi
 
 # Check 3: PR must be mergeable
@@ -438,13 +436,14 @@ elif [ "$AUTO_MODE" = false ]; then
 fi
 
 # Check 4: Status checks
-print_info "Checking status checks..."
+echo ""
+echo -e "${BLUE}📋 Status Checks${NC}"
 STATUS_CHECKS=$(echo "$PR_DETAILS" | jq -r '.statusCheckRollup // []')
 REQUIRED_CHECKS=$(echo "$STATUS_CHECKS" | jq -r '[.[] | select(.isRequired == true)]')
 REQUIRED_CHECKS_COUNT=$(echo "$REQUIRED_CHECKS" | jq 'length')
 
 if [ "$REQUIRED_CHECKS_COUNT" -gt 0 ]; then
-  echo "  Found $REQUIRED_CHECKS_COUNT required status check(s):"
+  echo "  Required: $REQUIRED_CHECKS_COUNT"
 
   echo "$REQUIRED_CHECKS" | jq -r '.[] | "  - \(.name): \(.conclusion // .status)"' | while read line; do
     if echo "$line" | grep -q "SUCCESS"; then
@@ -465,54 +464,55 @@ if [ "$REQUIRED_CHECKS_COUNT" -gt 0 ]; then
     VALIDATION_FAILED=true
   elif [ "$PENDING_CHECKS" -gt 0 ]; then
     print_warning "$PENDING_CHECKS required check(s) still pending"
-    print_info "Waiting for checks to complete..."
   else
     print_success "All required checks passed"
   fi
 else
-  print_info "No required status checks configured"
+  echo "  None configured"
 fi
 
-# Check 5: Reviews
-print_info "Checking reviews..."
+# Check 5: GitHub Reviews (formal reviews, not comments)
+echo ""
+echo -e "${BLUE}👥 GitHub Reviews${NC}"
 REVIEWS=$(echo "$PR_DETAILS" | jq -r '.reviews // []')
 REVIEW_COUNT=$(echo "$REVIEWS" | jq 'length')
 
 if [ "$REVIEW_COUNT" -gt 0 ]; then
-  # Get latest review state from each reviewer
   APPROVED_COUNT=$(echo "$REVIEWS" | jq -r '[.[] | select(.state == "APPROVED")] | length')
   CHANGES_REQUESTED=$(echo "$REVIEWS" | jq -r '[.[] | select(.state == "CHANGES_REQUESTED")] | length')
 
-  echo "  Reviews: $REVIEW_COUNT total"
-  echo "  Approved: $APPROVED_COUNT"
+  echo "  Total: $REVIEW_COUNT | Approved: $APPROVED_COUNT"
 
   if [ "$CHANGES_REQUESTED" -gt 0 ]; then
     print_warning "$CHANGES_REQUESTED reviewer(s) requested changes"
-  fi
-
-  if [ "$APPROVED_COUNT" -eq 0 ]; then
-    print_warning "No approving reviews yet"
-  else
+  elif [ "$APPROVED_COUNT" -gt 0 ]; then
     print_success "$APPROVED_COUNT approving review(s)"
   fi
 else
-  print_warning "No reviews yet"
+  echo "  None submitted"
 fi
 
-# Check 6: Sharkrite code review
-print_info "Checking for Sharkrite review..."
+# Check 6: Sharkrite code review (via PR comments or formal reviews)
+echo ""
+echo -e "${BLUE}🦈 Sharkrite Review${NC}"
 CLAUDE_REVIEW_FOUND=false
 
-# Get latest comment from Claude user (more robust than pattern matching)
-LATEST_CLAUDE_REVIEW=$(gh pr view $PR_NUMBER --json comments \
-  --jq '[.comments[] | select(.author.login == "claude" or .author.login == "claude-code" or .author.login == "github-actions[bot]")] | .[-1] | .body' \
+# First check formal reviews for Sharkrite marker
+LATEST_CLAUDE_REVIEW=$(gh pr view $PR_NUMBER --json reviews \
+  --jq '[.reviews[] | select(.body | contains("sharkrite-local-review") or contains("Claude Code Review"))] | .[-1] | .body' \
   2>/dev/null)
 
-if [ -n "$LATEST_CLAUDE_REVIEW" ]; then
+# If not in formal reviews, check PR comments for Sharkrite marker
+if [ -z "$LATEST_CLAUDE_REVIEW" ] || [ "$LATEST_CLAUDE_REVIEW" = "null" ]; then
+  LATEST_CLAUDE_REVIEW=$(gh pr view $PR_NUMBER --json comments \
+    --jq '[.comments[] | select(.body | contains("sharkrite-local-review") or contains("Claude Code Review"))] | .[-1] | .body' \
+    2>/dev/null)
+fi
+
+if [ -n "$LATEST_CLAUDE_REVIEW" ] && [ "$LATEST_CLAUDE_REVIEW" != "null" ]; then
   CLAUDE_REVIEW_FOUND=true
 
   # Parse CRITICAL count using multiple patterns (case-insensitive, flexible format)
-  # Matches: "CRITICAL: 0", "Critical: 2", "CRITICAL (3)", etc.
   CRITICAL_COUNT=$(echo "$LATEST_CLAUDE_REVIEW" | grep -oiE '(CRITICAL|critical)[[:space:]:]+\(?[0-9]+\)?' | grep -oE '[0-9]+' | head -1)
 
   if [ -z "$CRITICAL_COUNT" ]; then
@@ -520,23 +520,30 @@ if [ -n "$LATEST_CLAUDE_REVIEW" ]; then
     if echo "$LATEST_CLAUDE_REVIEW" | grep -q "### ❌ CRITICAL"; then
       CRITICAL_SECTION=$(echo "$LATEST_CLAUDE_REVIEW" | sed -n '/### ❌ CRITICAL/,/###/p')
       if echo "$CRITICAL_SECTION" | grep -q "#### "; then
-        CRITICAL_COUNT=1  # Assume at least 1 if section has content
+        CRITICAL_COUNT=1
       else
         CRITICAL_COUNT=0
       fi
     else
-      CRITICAL_COUNT=0  # No CRITICAL section found
+      CRITICAL_COUNT=0
     fi
   fi
 
+  # Check for overall assessment verdict
+  REVIEW_VERDICT=$(echo "$LATEST_CLAUDE_REVIEW" | grep -oiE "Overall Assessment:.*?(APPROVE|NEEDS WORK)" | head -1 || echo "")
+
   if [ "$CRITICAL_COUNT" -gt 0 ]; then
-    print_error "Sharkrite found $CRITICAL_COUNT CRITICAL issue(s) that must be addressed"
+    print_error "Found $CRITICAL_COUNT CRITICAL issue(s) - must be addressed"
     VALIDATION_FAILED=true
+  elif echo "$REVIEW_VERDICT" | grep -qi "APPROVE"; then
+    print_success "Review passed (APPROVE)"
+  elif echo "$REVIEW_VERDICT" | grep -qi "NEEDS WORK"; then
+    print_warning "Review verdict: NEEDS WORK"
   else
-    print_success "Sharkrite review passed (CRITICAL: 0)"
+    print_success "Review passed (CRITICAL: 0)"
   fi
 else
-  print_warning "No Sharkrite review found yet"
+  echo "  Not found"
 fi
 
 # Analyze HIGH and MEDIUM issues if review exists
@@ -656,6 +663,11 @@ fi
 
 if [ "$AUTO_MODE" = false ]; then
   print_header "✅ All Validations Passed"
+  echo "  • PR state: open, not draft, mergeable"
+  echo "  • Status checks: ${REQUIRED_CHECKS_COUNT:-0} required (all passed)"
+  echo "  • GitHub reviews: ${APPROVED_COUNT:-0} approved"
+  echo "  • Sharkrite review: $([ "$CLAUDE_REVIEW_FOUND" = true ] && echo "passed" || echo "not required")"
+  echo ""
 fi
 
 # Documentation completeness check
@@ -868,41 +880,37 @@ if [ $MERGE_EXIT_CODE -eq 0 ]; then
     fi
   fi
 
-  # Create follow-up issues from review "skip" items
-  if [ -f "$RITE_LIB_DIR/utils/create-followup-issues.sh" ]; then
-    source "$RITE_LIB_DIR/utils/create-followup-issues.sh"
+  # Check for follow-up issues (now created during assessment phase)
+  echo ""
+  echo -e "${BLUE}📋 Follow-up Issues${NC}"
 
-    if [ "$AUTO_MODE" = false ]; then
-      print_header "📋 Creating Follow-up Issues"
-    fi
-    print_info "Checking review for items to track..."
-    echo ""
+  # Check if assessment already created issues (look in PR body)
+  PR_BODY=$(gh pr view "$PR_NUMBER" --json body --jq '.body' 2>/dev/null || echo "")
+  ASSESSMENT_ISSUES=$(echo "$PR_BODY" | grep -oE "#[0-9]+" | sort -u || echo "")
 
-    create_followup_issues "$PR_NUMBER" "$PR_TITLE"
+  if [ -n "$ASSESSMENT_ISSUES" ]; then
+    ISSUE_COUNT=$(echo "$ASSESSMENT_ISSUES" | wc -l | tr -d ' ')
+    print_success "Assessment created $ISSUE_COUNT follow-up issue(s)"
+    echo "  Issues: $(echo $ASSESSMENT_ISSUES | tr '\n' ' ')"
 
-    if [ "$ISSUES_CREATED_COUNT" -gt 0 ]; then
-      echo ""
-      print_success "Created $ISSUES_CREATED_COUNT follow-up issue(s) from code review"
+    # Send Slack notification with merge summary
+    if [ -n "${SLACK_WEBHOOK:-}" ]; then
+      ISSUES_LIST=""
+      for issue_num in $(echo "$ASSESSMENT_ISSUES" | tr -d '#'); do
+        ISSUE_TITLE=$(gh issue view "$issue_num" --json title --jq '.title' 2>/dev/null || echo "Issue #$issue_num")
+        REPO_URL=$(gh repo view --json url --jq '.url' 2>/dev/null || echo "")
+        ISSUES_LIST="${ISSUES_LIST}• <${REPO_URL}/issues/${issue_num}|#${issue_num}>: ${ISSUE_TITLE}\n"
+      done
 
-      # Send Slack notification with created issues
-      if [ -n "${SLACK_WEBHOOK:-}" ]; then
-        # Build issues list for Slack
-        ISSUES_LIST=""
-        for issue_num in $ISSUES_CREATED; do
-          ISSUE_TITLE=$(gh issue view "$issue_num" --json title --jq '.title' 2>/dev/null || echo "Issue #$issue_num")
-          REPO_URL=$(gh repo view --json url --jq '.url' 2>/dev/null || echo "")
-          ISSUES_LIST="${ISSUES_LIST}• <${REPO_URL}/issues/${issue_num}|#${issue_num}>: ${ISSUE_TITLE}\n"
-        done
-
-        MERGE_NOTIFICATION="🎯 *PR #${PR_NUMBER} Merged Successfully*
+      MERGE_NOTIFICATION="🎯 *PR #${PR_NUMBER} Merged Successfully*
 
 ✅ ${PR_TITLE}
 
-📋 *Follow-up Issues Created* (${ISSUES_CREATED_COUNT}):
+📋 *Follow-up Issues* (${ISSUE_COUNT}):
 ${ISSUES_LIST}
 🔗 *PR Link*: <${PR_URL}|View PR #${PR_NUMBER}>"
 
-        SLACK_PAYLOAD=$(cat <<EOF
+      SLACK_PAYLOAD=$(cat <<EOF
 {
   "text": "PR #${PR_NUMBER} Merged",
   "blocks": [
@@ -927,21 +935,20 @@ ${ISSUES_LIST}
 EOF
 )
 
-        HTTP_CODE=$(curl -X POST "$SLACK_WEBHOOK" \
-          -H "Content-Type: application/json" \
-          -d "$SLACK_PAYLOAD" \
-          -w "%{http_code}" \
-          -s -o /dev/null 2>/dev/null || echo "000")
+      HTTP_CODE=$(curl -X POST "$SLACK_WEBHOOK" \
+        -H "Content-Type: application/json" \
+        -d "$SLACK_PAYLOAD" \
+        -w "%{http_code}" \
+        -s -o /dev/null 2>/dev/null || echo "000")
 
-        if [ "$HTTP_CODE" = "200" ]; then
-          print_success "Slack notification sent"
-        else
-          print_warning "Slack notification failed (HTTP $HTTP_CODE)"
-        fi
+      if [ "$HTTP_CODE" = "200" ]; then
+        print_success "Slack notification sent"
+      else
+        print_warning "Slack notification failed (HTTP $HTTP_CODE)"
       fi
-    else
-      print_info "No follow-up issues needed (all review items addressed)"
     fi
+  else
+    echo "  None (all items addressed in PR)"
   fi
 
   # Cleanup local branch if it exists

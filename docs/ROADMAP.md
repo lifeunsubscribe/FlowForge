@@ -156,7 +156,7 @@ rite 42 --review-only      # Shorthand for --issue
 ```
 
 **Use cases:**
-- PRs merged before Forge was set up
+- PRs merged before Sharkrite was set up
 - Quick-merged PRs that skipped review
 - Historical security audits
 - Compliance documentation
@@ -224,7 +224,7 @@ rite plan --roadmap docs/ROADMAP.md  # Parse roadmap format
 
 ## Dogfooding: Using Sharkrite on Sharkrite
 
-Once the theme system and issue generation are stable, Sharkrite development itself can use Forge:
+Once the theme system and issue generation are stable, Sharkrite development itself can use Sharkrite:
 
 1. **Issues:** Create issues in the rite repo for new features
 2. **Workflow:** Set up `.github/workflows/claude-code-review.yml` in rite repo

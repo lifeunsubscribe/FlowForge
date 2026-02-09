@@ -1,11 +1,20 @@
 #!/bin/bash
 
 # assess-documentation.sh - Pre-merge documentation completeness check
-# Uses Claude CLI to assess if docs need updating based on code changes
+# Extracts doc-related items from Sharkrite review and applies updates directly
+#
+# Usage:
+#   assess-documentation.sh <PR_NUMBER> [--auto]
+#
+# This script:
+# 1. Checks for existing Sharkrite review on the PR
+# 2. Extracts any documentation-related findings from the review
+# 3. If doc items found, applies updates directly
+# 4. If no review exists, performs standalone doc assessment
 
 set -euo pipefail
 
-# Source forge configuration
+# Source configuration
 _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -z "${RITE_LIB_DIR:-}" ]; then
   source "$_SCRIPT_DIR/../utils/config.sh"
@@ -36,20 +45,72 @@ if ! echo "test" | claude --print --dangerously-skip-permissions &> /dev/null; t
   exit 1
 fi
 
-print_header "📚 Assessing Documentation Completeness"
+# =============================================================================
+# STATIC OUTPUT HEADER
+# =============================================================================
+
+print_header "📚 Documentation Assessment"
+echo ""
 
 # Get PR details
-PR_DATA=$(gh pr view "$PR_NUMBER" --json title,body,files,commits)
+PR_DATA=$(gh pr view "$PR_NUMBER" --json title,body,files,commits,reviews,comments)
 PR_TITLE=$(echo "$PR_DATA" | jq -r '.title')
 PR_BODY=$(echo "$PR_DATA" | jq -r '.body // ""')
 
-print_info "PR #$PR_NUMBER: $PR_TITLE"
+echo "PR #$PR_NUMBER: $PR_TITLE"
+echo ""
+
+# =============================================================================
+# EXTRACT DOC ITEMS FROM SHARKRITE REVIEW
+# =============================================================================
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "📋 Review Context"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# Look for Sharkrite review in formal reviews first, then comments
+SHARKRITE_REVIEW=$(echo "$PR_DATA" | jq -r '[.reviews[] | select(.body | contains("sharkrite-local-review") or contains("sharkrite-review-data"))] | .[-1] | .body // ""' 2>/dev/null)
+
+if [ -z "$SHARKRITE_REVIEW" ] || [ "$SHARKRITE_REVIEW" = "null" ]; then
+  SHARKRITE_REVIEW=$(echo "$PR_DATA" | jq -r '[.comments[] | select(.body | contains("sharkrite-local-review") or contains("sharkrite-review-data"))] | .[-1] | .body // ""' 2>/dev/null)
+fi
+
+# Extract documentation-related items from review
+DOC_ITEMS_FROM_REVIEW=""
+REVIEW_HAS_DOC_ITEMS=false
+
+if [ -n "$SHARKRITE_REVIEW" ] && [ "$SHARKRITE_REVIEW" != "null" ]; then
+  print_success "  Found Sharkrite review"
+
+  # Extract doc-related mentions (look for documentation, docs, README, CLAUDE.md patterns)
+  DOC_ITEMS_FROM_REVIEW=$(echo "$SHARKRITE_REVIEW" | grep -iE "(documentation|docs/|README|CLAUDE\.md|update.*doc|missing.*doc|add.*doc)" | head -20 || echo "")
+
+  if [ -n "$DOC_ITEMS_FROM_REVIEW" ]; then
+    REVIEW_HAS_DOC_ITEMS=true
+    DOC_ITEM_COUNT=$(echo "$DOC_ITEMS_FROM_REVIEW" | wc -l | tr -d ' ')
+    print_info "  Found $DOC_ITEM_COUNT documentation-related items in review"
+  else
+    print_info "  No documentation items flagged in review"
+  fi
+else
+  print_warning "  No Sharkrite review found - will perform standalone assessment"
+fi
+
+echo ""
+
+# =============================================================================
+# GATHER CONTEXT
+# =============================================================================
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "📁 Changed Files"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 # Get changed files
 CHANGED_FILES=$(echo "$PR_DATA" | jq -r '.files[].path' | grep -v '^docs/' | head -20)
 FILE_COUNT=$(echo "$CHANGED_FILES" | wc -l | xargs)
 
-print_info "Changed files (excluding docs/): $FILE_COUNT"
+echo "  Code files changed: $FILE_COUNT"
 
 # Get commit messages for context
 COMMIT_MESSAGES=$(echo "$PR_DATA" | jq -r '.commits[].messageHeadline' | head -10)
@@ -107,7 +168,29 @@ for doc in docs/development/*.md; do
   fi
 done
 
-# Build assessment prompt
+# =============================================================================
+# DOCUMENTATION ASSESSMENT
+# =============================================================================
+
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "🔍 Assessment"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# Build assessment prompt - include review context if available
+REVIEW_CONTEXT_SECTION=""
+if [ "$REVIEW_HAS_DOC_ITEMS" = true ]; then
+  REVIEW_CONTEXT_SECTION="
+**Documentation Items from Sharkrite Review:**
+The code review already identified these documentation-related items. Use these as your primary guide:
+\`\`\`
+$DOC_ITEMS_FROM_REVIEW
+\`\`\`
+
+Focus on addressing the specific items mentioned in the review.
+"
+fi
+
 ASSESSMENT_PROMPT=$(cat <<EOF
 You are reviewing a pull request to assess if documentation needs updating.
 
@@ -115,7 +198,7 @@ You are reviewing a pull request to assess if documentation needs updating.
 
 **PR Description:**
 $PR_BODY
-
+$REVIEW_CONTEXT_SECTION
 **Changed Files (excluding docs/):**
 $CHANGED_FILES
 
@@ -193,40 +276,47 @@ REASON: <Brief explanation>
 EOF
 )
 
-print_info "Running documentation assessment..."
+print_info "Analyzing documentation requirements..."
 
 # Run assessment
 ASSESSMENT_OUTPUT=$(echo "$ASSESSMENT_PROMPT" | claude --print --dangerously-skip-permissions 2>&1)
+
+# =============================================================================
+# APPLY UPDATES
+# =============================================================================
+
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "📝 Updates"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 if echo "$ASSESSMENT_OUTPUT" | grep -q "^NEEDS_UPDATE"; then
   DOCS_TO_UPDATE=$(echo "$ASSESSMENT_OUTPUT" | grep "^NEEDS_UPDATE:" | sed 's/NEEDS_UPDATE: //')
   REASON=$(echo "$ASSESSMENT_OUTPUT" | grep "^REASON:" | sed 's/REASON: //')
 
-  print_warning "⚠️  Documentation updates recommended"
-  echo ""
-  print_info "Files to update: $DOCS_TO_UPDATE"
-  print_info "Reason: $REASON"
+  echo "  Status: Updates needed"
+  echo "  Files: $DOCS_TO_UPDATE"
+  echo "  Reason: $REASON"
   echo ""
 
   if [ "$AUTO_MODE" = "--auto" ]; then
-    print_warning "⚠️  Documentation updates needed - applying updates now"
-
     # Get PR diff for context
     PR_DIFF=$(gh pr diff $PR_NUMBER | head -300)
 
     # For each file that needs updating, read current content and generate update
     IFS=',' read -ra FILES_ARRAY <<< "$DOCS_TO_UPDATE"
     UPDATED_FILES=()
+    SKIPPED_FILES=()
 
     for doc_file in "${FILES_ARRAY[@]}"; do
       doc_file=$(echo "$doc_file" | xargs)  # trim whitespace
 
       if [ ! -f "$doc_file" ]; then
-        print_warning "File not found: $doc_file, skipping"
+        SKIPPED_FILES+=("$doc_file (not found)")
         continue
       fi
 
-      print_info "Updating $doc_file..."
+      echo "  Updating: $doc_file"
 
       CURRENT_CONTENT=$(cat "$doc_file")
 
@@ -278,7 +368,7 @@ EOF
         MIN_SIZE=$((ORIGINAL_SIZE * 80 / 100))
 
         if [ "$NEW_SIZE" -lt "$MIN_SIZE" ]; then
-          print_error "Updated $doc_file too short ($NEW_SIZE lines vs $ORIGINAL_SIZE original), skipping"
+          SKIPPED_FILES+=("$doc_file (truncated output)")
           continue
         fi
 
@@ -288,26 +378,47 @@ EOF
         # Apply update
         echo "$UPDATED_CONTENT" > "$doc_file"
         UPDATED_FILES+=("$doc_file")
-        print_success "✓ Updated $doc_file"
+        print_success "    ✓ Updated"
       else
-        print_error "Failed to generate update for $doc_file"
+        SKIPPED_FILES+=("$doc_file (generation failed)")
       fi
     done
 
+    echo ""
+
+    # =============================================================================
+    # SUMMARY
+    # =============================================================================
+
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "📊 Summary"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
     if [ ${#UPDATED_FILES[@]} -gt 0 ]; then
-      print_success "✓ Documentation updated: ${UPDATED_FILES[*]}"
+      echo "  Updated: ${#UPDATED_FILES[@]} file(s)"
+      for f in "${UPDATED_FILES[@]}"; do
+        echo "    ✓ $f"
+      done
 
       # Git add the updated docs
       git add "${UPDATED_FILES[@]}"
 
       # Commit doc updates
-      git commit -m "docs: update documentation for PR #$PR_NUMBER
+      COMMIT_MSG="docs: update documentation for PR #$PR_NUMBER
 
 Auto-updated by doc assessment:
 - Files: ${UPDATED_FILES[*]}
 - Reason: $REASON
 
-Related: #$PR_NUMBER" || print_warning "No changes to commit (docs may already be up to date)"
+Related: #$PR_NUMBER"
+
+      if git commit -m "$COMMIT_MSG" 2>/dev/null; then
+        echo ""
+        echo "  Committed: docs update for PR #$PR_NUMBER"
+      else
+        echo ""
+        echo "  Note: No changes to commit (docs may already be up to date)"
+      fi
 
       # Send Slack notification
       if [ -n "${SLACK_WEBHOOK:-}" ]; then
@@ -332,10 +443,20 @@ EOF
           --silent --output /dev/null
       fi
     else
-      print_warning "No documentation files were updated"
+      echo "  Updated: 0 files"
     fi
 
-    # Don't block merge - docs are updated
+    if [ ${#SKIPPED_FILES[@]} -gt 0 ]; then
+      echo ""
+      echo "  Skipped: ${#SKIPPED_FILES[@]} file(s)"
+      for f in "${SKIPPED_FILES[@]}"; do
+        echo "    ⚠ $f"
+      done
+    fi
+
+    echo ""
+
+    # Don't block merge - docs are updated (or attempted)
     exit 0
   else
     # Interactive mode: ask user
@@ -347,9 +468,17 @@ EOF
     fi
   fi
 else
-  print_success "✅ Documentation is up to date"
-  REASON=$(echo "$ASSESSMENT_OUTPUT" | grep "^REASON:" | sed 's/REASON: //' || echo "No updates needed")
-  print_info "$REASON"
+  echo "  Status: No updates needed"
+  REASON=$(echo "$ASSESSMENT_OUTPUT" | grep "^REASON:" | sed 's/REASON: //' || echo "Documentation is current")
+  echo "  Reason: $REASON"
+  echo ""
+
+  # Still show summary for consistency
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "📊 Summary"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  ✅ Documentation is up to date"
+  echo ""
 fi
 
 exit 0

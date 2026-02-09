@@ -2,7 +2,7 @@
 # batch-process-issues.sh
 # Batch process multiple GitHub issues in unsupervised mode
 # Usage:
-#   forge 19 21 31 32              # Process specific issues
+#   rite 19 21 31 32              # Process specific issues
 #   rite --label bug              # Process all issues with label
 #   rite --milestone v1.0         # Process all issues in milestone
 #   rite --followup               # Auto-discover follow-up pairs (max 4)
@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-# Source forge configuration
+# Source configuration
 _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -z "${RITE_LIB_DIR:-}" ]; then
   source "$_SCRIPT_DIR/../utils/config.sh"
@@ -219,7 +219,7 @@ if [ ${#ISSUE_LIST[@]} -eq 0 ]; then
   print_error "No issues specified"
   echo ""
   echo "Usage:"
-  echo "  forge 19 21 31 32              # Process specific issues"
+  echo "  rite 19 21 31 32              # Process specific issues"
   echo "  rite --label bug              # Process all issues with label"
   echo "  rite --milestone v1.0         # Process all issues in milestone"
   echo "  rite --followup               # Auto-discover follow-up pairs (max 4)"

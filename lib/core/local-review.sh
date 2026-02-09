@@ -136,18 +136,18 @@ if [ "$DIFF_FILES" -eq 0 ] || [ -z "$PR_DIFF" ] || [ "$PR_DIFF" = "" ]; then
 fi
 
 # Load review instructions template
-# Priority: 1. Repo-specific (.github/claude-code/), 2. Forge default, 3. Embedded fallback
+# Priority: 1. Repo-specific (.github/claude-code/), 2. Sharkrite default, 3. Embedded fallback
 # Use absolute path from RITE_PROJECT_ROOT to avoid CWD dependency
 REPO_TEMPLATE="$RITE_PROJECT_ROOT/.github/claude-code/pr-review-instructions.md"
-FORGE_TEMPLATE="$RITE_INSTALL_DIR/templates/github/claude-code/pr-review-instructions.md"
+RITE_TEMPLATE="$RITE_INSTALL_DIR/templates/github/claude-code/pr-review-instructions.md"
 
 if [ -f "$REPO_TEMPLATE" ]; then
   REVIEW_TEMPLATE="$REPO_TEMPLATE"
   TEMPLATE_LINES=$(wc -l < "$REPO_TEMPLATE" | tr -d ' ')
   print_info "Using repo-specific review instructions ($TEMPLATE_LINES lines)"
-elif [ -f "$FORGE_TEMPLATE" ]; then
-  REVIEW_TEMPLATE="$FORGE_TEMPLATE"
-  print_info "Using forge default review instructions"
+elif [ -f "$RITE_TEMPLATE" ]; then
+  REVIEW_TEMPLATE="$RITE_TEMPLATE"
+  print_info "Using Sharkrite default review instructions"
 else
   REVIEW_TEMPLATE=""
   print_warning "No review template found"
@@ -180,6 +180,51 @@ $(head -200 "$RITE_PROJECT_ROOT/CLAUDE.md")"
   print_info "Loaded project context from CLAUDE.md"
 fi
 
+# Load previous assessment context if available (for iteration awareness)
+PREVIOUS_ASSESSMENT_CONTEXT=""
+PREVIOUS_ASSESSMENT=$(gh pr view "$PR_NUMBER" --json comments \
+  --jq '[.comments[] | select(.body | contains("sharkrite-assessment"))] | .[-1] | .body' \
+  2>/dev/null)
+
+if [ -n "$PREVIOUS_ASSESSMENT" ] && [ "$PREVIOUS_ASSESSMENT" != "null" ]; then
+  print_info "Found previous assessment - review will maintain consistency"
+
+  # Extract summary from previous assessment
+  PREV_NOW=$(echo "$PREVIOUS_ASSESSMENT" | grep -oE "ACTIONABLE_NOW:\*\* [0-9]+" | grep -oE "[0-9]+" || echo "0")
+  PREV_LATER=$(echo "$PREVIOUS_ASSESSMENT" | grep -oE "ACTIONABLE_LATER:\*\* [0-9]+" | grep -oE "[0-9]+" || echo "0")
+  PREV_DISMISSED=$(echo "$PREVIOUS_ASSESSMENT" | grep -oE "DISMISSED:\*\* [0-9]+" | grep -oE "[0-9]+" || echo "0")
+
+  # Check for linked follow-up issues
+  PR_BODY=$(gh pr view "$PR_NUMBER" --json body --jq '.body' 2>/dev/null || echo "")
+  FOLLOWUP_ISSUES=$(echo "$PR_BODY" | grep -oE "#[0-9]+" | sort -u | tr '\n' ' ' || echo "none")
+
+  PREVIOUS_ASSESSMENT_CONTEXT="
+
+---
+
+## Previous Assessment Context
+
+A previous assessment was performed on this PR. Maintain consistency with prior classifications.
+
+**Previous Classification Summary:**
+- ACTIONABLE_NOW: ${PREV_NOW} items (verify these are fixed)
+- ACTIONABLE_LATER: ${PREV_LATER} items (issues created, skip these)
+- DISMISSED: ${PREV_DISMISSED} items (not actionable, skip these)
+
+**Follow-up Issues Created:** ${FOLLOWUP_ISSUES}
+
+**Your Task:**
+1. Verify ACTIONABLE_NOW items from previous assessment are properly fixed
+2. Skip items that already have follow-up issues created
+3. Skip DISMISSED items unless the code has materially changed
+4. Flag genuinely NEW issues only
+
+**Full Previous Assessment:**
+${PREVIOUS_ASSESSMENT}
+
+---"
+fi
+
 # Get current timestamp for review metadata
 REVIEW_TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
@@ -189,6 +234,7 @@ EFFECTIVE_MODEL="${RITE_REVIEW_MODEL:-opus}"
 # Build the full prompt
 REVIEW_PROMPT="$REVIEW_INSTRUCTIONS
 $PROJECT_CONTEXT
+$PREVIOUS_ASSESSMENT_CONTEXT
 
 ---
 
@@ -276,44 +322,73 @@ REVIEW_COMMENT="<!-- sharkrite-local-review model:${EFFECTIVE_MODEL} timestamp:$
 $REVIEW_OUTPUT"
 
 if [ "$POST_REVIEW" = true ]; then
-  # Post the review as a comment
-  print_info "Posting review to PR #$PR_NUMBER..."
+  # Parse review to determine verdict
+  CRITICAL_COUNT=$(echo "$REVIEW_OUTPUT" | grep -ciE "^### CRITICAL|CRITICAL:|❌ CRITICAL" || echo "0")
+  HIGH_COUNT=$(echo "$REVIEW_OUTPUT" | grep -ciE "^### HIGH|HIGH:|⚠️ HIGH" || echo "0")
+  MEDIUM_COUNT=$(echo "$REVIEW_OUTPUT" | grep -ciE "^### MEDIUM|MEDIUM:|📋 MEDIUM" || echo "0")
+  LOW_COUNT=$(echo "$REVIEW_OUTPUT" | grep -ciE "^### LOW|LOW:|💡 LOW" || echo "0")
 
-  COMMENT_URL=$(gh pr comment "$PR_NUMBER" --body "$REVIEW_COMMENT" 2>&1) || {
-    print_error "Failed to post review comment"
-    echo "$COMMENT_URL"
-    echo ""
-    echo "Review content (not posted):"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "$REVIEW_OUTPUT"
-    exit 1
+  # Check for explicit approval in review output
+  HAS_APPROVE=$(echo "$REVIEW_OUTPUT" | grep -ciE "Overall.*APPROVE|Assessment.*APPROVE|\*\*APPROVE\*\*" || echo "0")
+
+  # Determine review verdict
+  # - CRITICAL issues = request changes (blocking)
+  # - No CRITICAL + explicit APPROVE = approve
+  # - Otherwise = comment (non-blocking feedback)
+  REVIEW_VERDICT="--comment"
+  VERDICT_LABEL="COMMENT"
+
+  if [ "$CRITICAL_COUNT" -gt 0 ]; then
+    REVIEW_VERDICT="--request-changes"
+    VERDICT_LABEL="REQUEST_CHANGES"
+    print_warning "Review contains $CRITICAL_COUNT CRITICAL issue(s) - requesting changes"
+  elif [ "$HAS_APPROVE" -gt 0 ] && [ "$HIGH_COUNT" -eq 0 ]; then
+    REVIEW_VERDICT="--approve"
+    VERDICT_LABEL="APPROVE"
+    print_success "Review passed - approving PR"
+  else
+    print_info "Review has non-blocking findings - posting as comment"
+  fi
+
+  # Post as formal PR review (not just a comment)
+  print_info "Posting formal review to PR #$PR_NUMBER ($VERDICT_LABEL)..."
+
+  REVIEW_RESULT=$(gh pr review "$PR_NUMBER" $REVIEW_VERDICT --body "$REVIEW_COMMENT" 2>&1) || {
+    # If formal review fails (e.g., already reviewed), fall back to comment
+    print_warning "Formal review failed, falling back to PR comment"
+    print_info "Reason: $REVIEW_RESULT"
+
+    REVIEW_RESULT=$(gh pr comment "$PR_NUMBER" --body "$REVIEW_COMMENT" 2>&1) || {
+      print_error "Failed to post review"
+      echo "$REVIEW_RESULT"
+      echo ""
+      echo "Review content (not posted):"
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo "$REVIEW_OUTPUT"
+      exit 1
+    }
   }
 
   echo ""
   print_success "Review posted successfully!"
-  echo "  $COMMENT_URL"
+  echo "  Verdict: $VERDICT_LABEL"
   echo ""
 
   # Invalidate cached assessments for this PR (new review = old assessment is stale)
   invalidate_pr_cache "$PR_NUMBER"
 
   # Output summary
-  CRITICAL_COUNT=$(echo "$REVIEW_OUTPUT" | grep -ciE "^### CRITICAL|CRITICAL:" || echo "0")
-  HIGH_COUNT=$(echo "$REVIEW_OUTPUT" | grep -ciE "^### HIGH|HIGH:" || echo "0")
-  MEDIUM_COUNT=$(echo "$REVIEW_OUTPUT" | grep -ciE "^### MEDIUM|MEDIUM:" || echo "0")
-  LOW_COUNT=$(echo "$REVIEW_OUTPUT" | grep -ciE "^### LOW|LOW:" || echo "0")
-
   echo "Review Summary:"
   echo "  CRITICAL: $CRITICAL_COUNT"
   echo "  HIGH: $HIGH_COUNT"
   echo "  MEDIUM: $MEDIUM_COUNT"
   echo "  LOW: $LOW_COUNT"
 
-  # Extract overall verdict if present
-  VERDICT=$(echo "$REVIEW_OUTPUT" | grep -oE "Overall:.*$" | head -1 || echo "")
-  if [ -n "$VERDICT" ]; then
+  # Extract overall assessment if present
+  OVERALL_ASSESSMENT=$(echo "$REVIEW_OUTPUT" | grep -oE "Overall Assessment:.*$" | head -1 || echo "")
+  if [ -n "$OVERALL_ASSESSMENT" ]; then
     echo ""
-    echo "  $VERDICT"
+    echo "  $OVERALL_ASSESSMENT"
   fi
 else
   # Preview mode - just display the review

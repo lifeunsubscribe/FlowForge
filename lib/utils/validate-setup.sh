@@ -40,7 +40,7 @@ cd "$RITE_PROJECT_ROOT"
 
 ISSUES_FOUND=0
 
-print_header "🔍 Forge Workflow Setup Validation"
+print_header "🔍 Sharkrite Workflow Setup Validation"
 
 # Check 1: Git repository
 print_info "Checking Git repository..."
@@ -140,7 +140,7 @@ for dir in "${REQUIRED_DIRS[@]}"; do
 done
 echo ""
 
-# Check 6: Forge installation
+# Check 6: Sharkrite installation
 print_info "Checking rite installation..."
 
 REQUIRED_RITE_DIRS=(
@@ -469,7 +469,7 @@ echo ""
 print_header "📊 Validation Summary"
 
 if [ $ISSUES_FOUND -eq 0 ]; then
-  print_success "All checks passed! Forge workflow automation is ready to use."
+  print_success "All checks passed! Sharkrite workflow automation is ready to use."
   echo ""
   echo "Next steps:"
   echo "  1. Start workflow: rite ISSUE_NUMBER"

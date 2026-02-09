@@ -1,4 +1,4 @@
-# Forge Scratchpad
+# Sharkrite Scratchpad
 
 **Purpose:** Working notes, security findings, and development context
 
@@ -18,7 +18,7 @@ _No active work — run `rite <issue>` to start_
 
 ## Recent Security Findings (Last 5 PRs)
 
-_Security issues found in recent PR reviews. Forge updates this automatically._
+_Security issues found in recent PR reviews. Sharkrite updates this automatically._
 
 ---
 
