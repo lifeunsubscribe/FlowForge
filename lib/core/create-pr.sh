@@ -151,28 +151,37 @@ if [ ! -z "$EXISTING_PR" ] && [ "$EXISTING_PR" != "null" ]; then
     echo ""
   fi
 
-  # Check if there are new commits since PR was last updated
+  # Push new commits if needed
   CURRENT_HEAD=$(git rev-parse HEAD)
   PR_HEAD=$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid')
+  PUSHED_NEW_COMMITS=false
 
   if [ "$CURRENT_HEAD" != "$PR_HEAD" ]; then
-    # Push new commits to PR first
     print_status "Pushing new commits to PR..."
     if ! git push origin "$CURRENT_BRANCH"; then
       print_error "Failed to push commits to remote"
       print_info "Your branch may be behind the remote. Try: git pull --rebase origin $CURRENT_BRANCH"
       exit 1
     fi
+    PUSHED_NEW_COMMITS=true
+    print_success "Pushed new commits"
+  else
+    print_success "PR #$PR_NUMBER branch is up to date — all commits already pushed"
+  fi
 
-    # Update changes summary in PR description (preserves issue link, checklists, etc.)
+  # Update PR body with changes summary if stale or missing.
+  # This is separate from the push check because claude-workflow.sh pushes
+  # commits before create-pr.sh runs, so the body can be stale even when
+  # CURRENT_HEAD == PR_HEAD.
+  EXISTING_BODY=$(gh pr view "$PR_NUMBER" --json body --jq '.body' 2>/dev/null || echo "")
+
+  if [ "$PUSHED_NEW_COMMITS" = true ] || ! echo "$EXISTING_BODY" | grep -qF "$SUMMARY_START"; then
     print_status "Updating PR description..."
-    EXISTING_BODY=$(gh pr view "$PR_NUMBER" --json body --jq '.body' 2>/dev/null || echo "")
     FRESH_SUMMARY=$(build_changes_summary "$BASE_BRANCH")
 
     if [ -n "$EXISTING_BODY" ]; then
       UPDATED_BODY=$(replace_changes_summary "$EXISTING_BODY" "$FRESH_SUMMARY")
     else
-      # No existing body (shouldn't happen) — build a minimal one
       ISSUE_LINK=$(echo "$EXISTING_BODY" | grep -oE '(Closes|closes|Fixes|fixes|Resolves|resolves) #[0-9]+' | head -1)
       UPDATED_BODY="## Summary
 
@@ -182,12 +191,9 @@ ${FRESH_SUMMARY}"
     fi
 
     gh pr edit "$PR_NUMBER" --body "$UPDATED_BODY" 2>/dev/null || print_warning "Could not update PR description"
-    print_success "PR updated with new commits"
-    echo ""
-  else
-    print_success "PR #$PR_NUMBER branch is up to date — all commits already pushed"
-    echo ""
+    print_success "PR description updated"
   fi
+  echo ""
 fi
 
 # If PR doesn't exist, create it
