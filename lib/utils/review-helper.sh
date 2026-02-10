@@ -96,8 +96,6 @@ trigger_local_review() {
     return 1
   fi
 
-  _log_review_method "local" "Generating review with local Sharkrite"
-
   if [ "$auto_mode" = true ]; then
     "$local_review_script" "$pr_number" --post --auto 2>&1
   else
@@ -130,7 +128,7 @@ get_review_for_pr() {
   case "$method" in
     local)
       # Always use local review
-      _log_review_method "local" "RITE_REVIEW_METHOD=local (config preference)"
+      export RITE_REVIEW_REASON="RITE_REVIEW_METHOD=local (config preference)"
       if [ "$auto_mode" = true ]; then
         trigger_local_review "$pr_number" --auto
       else
@@ -159,7 +157,7 @@ get_review_for_pr() {
         echo -e "${BLUE}ℹ️  Waiting for Claude for GitHub app review...${NC}"
         return 0  # Caller should wait for app review
       else
-        _log_review_method "local" "RITE_REVIEW_METHOD=auto (fallback: no app detected)" "true"
+        export RITE_REVIEW_REASON="RITE_REVIEW_METHOD=auto (fallback: no app detected)"
         if [ "$auto_mode" = true ]; then
           trigger_local_review "$pr_number" --auto
         else
@@ -195,7 +193,7 @@ handle_stale_review() {
   case "$method" in
     local)
       # Always use local review for refresh
-      _log_review_method "local" "RITE_REVIEW_METHOD=local (config preference, triggering fresh review)"
+      export RITE_REVIEW_REASON="RITE_REVIEW_METHOD=local (triggering fresh review)"
       ;;
 
     app)
@@ -207,7 +205,7 @@ handle_stale_review() {
 
     auto|*)
       # Auto mode: use local review for refresh (this is fallback behavior since app can't re-review)
-      _log_review_method "local" "RITE_REVIEW_METHOD=auto (fallback: app cannot auto-refresh stale reviews)" "true"
+      export RITE_REVIEW_REASON="RITE_REVIEW_METHOD=auto (triggering fresh review)"
       ;;
   esac
 

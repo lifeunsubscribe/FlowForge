@@ -106,6 +106,7 @@ print_success() { echo -e "${GREEN}✅ $1${NC}" >&2; }
 print_error() { echo -e "${RED}❌ $1${NC}" >&2; }
 print_warning() { echo -e "${YELLOW}⚠️  $1${NC}" >&2; }
 print_info() { echo -e "${BLUE}ℹ️  $1${NC}" >&2; }
+print_status() { echo -e "${BLUE}$1${NC}" >&2; }
 print_critical() { echo -e "${RED}🚨 CRITICAL: $1${NC}" >&2; }
 print_high() { echo -e "${MAGENTA}⚡ HIGH: $1${NC}" >&2; }
 print_medium() { echo -e "${YELLOW}📋 MEDIUM: $1${NC}" >&2; }
@@ -314,7 +315,7 @@ rm -f "$GH_STDERR"
 
 if [ "$REVIEW_JSON" = "{}" ] || [ -z "$REVIEW_JSON" ] || [ "$REVIEW_JSON" = "null" ]; then
   # No review found - auto-generate one
-  print_info "No review found - generating local review..."
+  print_status "No review found - generating local review..."
   echo ""
 
   # Run local review with --post --auto
@@ -420,7 +421,7 @@ if [ "$RETRY_COUNT" -gt 0 ]; then
   print_info "Retry $RETRY_COUNT: Skipping stale check (review was generated this cycle)"
   REVIEW_TIME=$(echo "$REVIEW_JSON" | jq -r '.createdAt' 2>/dev/null)
 else
-  print_info "Checking if review is current..."
+  print_status "Checking if review is current..."
 fi
 echo ""
 
@@ -500,7 +501,7 @@ if [ "$RETRY_COUNT" -eq 0 ]; then
     fi
 
     # Re-fetch the review after posting new one
-    print_info "Fetching updated review..."
+    print_status "Fetching updated review..."
     sleep 2  # Brief pause for GitHub API to reflect new comment
 
     # Sort by createdAt descending and get the newest review (not just last in array)
@@ -545,6 +546,21 @@ echo ""
 # This runs BEFORE displaying summary so counts are accurate
 # ============================================================================
 
+# Early exit: if the review has zero findings across all severities, skip
+# assessment entirely and go straight to merge. The assessment's job is to
+# categorize review findings — when there are none, there's nothing to categorize.
+# Without this, the assessment Claude reads positive prose and invents issues.
+REVIEW_FINDINGS_LINE=$(grep -oE "Findings: CRITICAL: [0-9]+ [|] HIGH: [0-9]+ [|] MEDIUM: [0-9]+ [|] LOW: [0-9]+" "$REVIEW_FILE" 2>/dev/null | head -1 || true)
+if [ -n "$REVIEW_FINDINGS_LINE" ]; then
+  REVIEW_TOTAL_FINDINGS=$(echo "$REVIEW_FINDINGS_LINE" | grep -oE "[0-9]+" | awk '{sum += $1} END {print sum}')
+  if [ "${REVIEW_TOTAL_FINDINGS:-0}" -eq 0 ]; then
+    print_header "🦈 Smart Assessment (Sharkrite)"
+    print_success "Review has zero findings — skipping assessment, proceeding to merge"
+    echo ""
+    exit 0
+  fi
+fi
+
 print_header "🦈 Smart Assessment (Sharkrite)"
 
 ACTIONABLE_COUNT=0
@@ -552,9 +568,9 @@ ACTIONABLE_COUNT=0
 if [ -f "$RITE_LIB_DIR/core/assess-review-issues.sh" ]; then
   # Only show retry count if actually retrying (count > 0)
   if [ "$RETRY_COUNT" -gt 0 ]; then
-    print_info "Running Claude CLI assessment (retry $RETRY_COUNT/3)..."
+    print_status "Running Claude CLI assessment (retry $RETRY_COUNT/3)..."
   else
-    print_info "Running Claude CLI assessment on all review issues..."
+    print_status "Running Claude CLI assessment on all review issues..."
   fi
 
   # Run smart assessment - pass --auto flag if in auto mode
@@ -562,12 +578,11 @@ if [ -f "$RITE_LIB_DIR/core/assess-review-issues.sh" ]; then
   # and categorizes ALL contents, outputting filtered ACTIONABLE items to stdout
   # Use process substitution to show stderr in real-time (Claude output streams to terminal)
   ASSESSMENT_STDERR=$(mktemp)
+  ASSESSMENT_EXIT_CODE=0
   if [ "$AUTO_MODE" = true ]; then
-    ASSESSMENT_RESULT=$("$RITE_LIB_DIR/core/assess-review-issues.sh" "$PR_NUMBER" "$REVIEW_FILE" --auto 2> >(tee "$ASSESSMENT_STDERR" >&2))
-    ASSESSMENT_EXIT_CODE=$?
+    ASSESSMENT_RESULT=$("$RITE_LIB_DIR/core/assess-review-issues.sh" "$PR_NUMBER" "$REVIEW_FILE" --auto 2> >(tee "$ASSESSMENT_STDERR" >&2)) || ASSESSMENT_EXIT_CODE=$?
   else
-    ASSESSMENT_RESULT=$("$RITE_LIB_DIR/core/assess-review-issues.sh" "$PR_NUMBER" "$REVIEW_FILE" 2> >(tee "$ASSESSMENT_STDERR" >&2))
-    ASSESSMENT_EXIT_CODE=$?
+    ASSESSMENT_RESULT=$("$RITE_LIB_DIR/core/assess-review-issues.sh" "$PR_NUMBER" "$REVIEW_FILE" 2> >(tee "$ASSESSMENT_STDERR" >&2)) || ASSESSMENT_EXIT_CODE=$?
   fi
   # Wait for tee subprocess to finish writing
   wait
@@ -594,9 +609,9 @@ if [ -f "$RITE_LIB_DIR/core/assess-review-issues.sh" ]; then
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "📊 Assessment Summary:"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    print_info "  • ACTIONABLE_NOW: $ACTIONABLE_NOW_COUNT items (fix in this PR)"
-    print_info "  • ACTIONABLE_LATER: $ACTIONABLE_LATER_COUNT items (defer to tech-debt)"
-    print_info "  • DISMISSED: $DISMISSED_COUNT items (not worth tracking)"
+    print_status "  • ACTIONABLE_NOW: $ACTIONABLE_NOW_COUNT items (fix in this PR)"
+    print_status "  • ACTIONABLE_LATER: $ACTIONABLE_LATER_COUNT items (defer to tech-debt)"
+    print_status "  • DISMISSED: $DISMISSED_COUNT items (not worth tracking)"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
 
@@ -613,7 +628,7 @@ if [ -f "$RITE_LIB_DIR/core/assess-review-issues.sh" ]; then
     elif [ "$ACTIONABLE_NOW_COUNT" -eq 0 ] && [ "$ACTIONABLE_LATER_COUNT" -gt 0 ]; then
       # Only ACTIONABLE_LATER items - create tech-debt issue and merge
       print_info "✅ No immediate fixes needed"
-      print_info "📝 Creating tech-debt issue for $ACTIONABLE_LATER_COUNT deferred items..."
+      print_status "📝 Creating tech-debt issue for $ACTIONABLE_LATER_COUNT deferred items..."
 
       # Set flag to create tech-debt issue, then exit 0 to allow merge
       CREATE_SECURITY_DEBT=true
@@ -639,7 +654,7 @@ if [ -f "$RITE_LIB_DIR/core/assess-review-issues.sh" ]; then
           FILTERED_ASSESSMENT="$ASSESSMENT_RESULT"
         else
           print_info "✅ No CRITICAL items remain (only HIGH/MEDIUM/LOW)"
-          print_info "Creating tech-debt issue for remaining items..."
+          print_status "Creating tech-debt issue for remaining items..."
           # Treat remaining ACTIONABLE_NOW as ACTIONABLE_LATER at retry limit
           CREATE_SECURITY_DEBT=true
           FILTERED_ASSESSMENT="$ASSESSMENT_RESULT"
@@ -767,7 +782,7 @@ fi
 
 # Handle tech-debt case (retry limit reached, no CRITICAL items)
 if [ "${CREATE_SECURITY_DEBT:-false}" = "true" ]; then
-  print_info "Creating tech-debt issue with remaining HIGH/MEDIUM/LOW items..."
+  print_status "Creating tech-debt issue with remaining HIGH/MEDIUM/LOW items..."
 
   # Use filtered review for tech-debt issue
   FOLLOWUP_LABEL="tech-debt"
@@ -778,7 +793,7 @@ fi
 
 # Handle critical follow-up case (retry limit reached, CRITICAL items remain)
 if [ "${CREATE_CRITICAL_FOLLOWUP:-false}" = "true" ]; then
-  print_info "Creating CRITICAL follow-up issue for manual intervention..."
+  print_status "Creating CRITICAL follow-up issue for manual intervention..."
 
   # Use filtered review for critical follow-up
   FOLLOWUP_LABEL="review-follow-up"
@@ -804,14 +819,14 @@ if [ "${CREATE_FOLLOWUP_ISSUES:-false}" = true ]; then
   if [ "$USE_FILTERED" = true ] && [ -n "$FILTERED_CONTENT" ]; then
     # Determine which items to include based on issue type
     if [ "${CREATE_SECURITY_DEBT:-false}" = "true" ]; then
-      print_info "Extracting ACTIONABLE_LATER items for tech-debt issue..."
+      print_status "Extracting ACTIONABLE_LATER items for tech-debt issue..."
       CRITICAL_ISSUES=$(echo "$FILTERED_CONTENT" | grep -B2 -A 20 "ACTIONABLE_LATER" | grep -B2 -A 20 "CRITICAL" || echo "")
       HIGH_ISSUES=$(echo "$FILTERED_CONTENT" | grep -B2 -A 20 "ACTIONABLE_LATER" | grep -B2 -A 20 "HIGH" || echo "")
       MEDIUM_ISSUES=$(echo "$FILTERED_CONTENT" | grep -B2 -A 20 "ACTIONABLE_LATER" | grep -B2 -A 20 "MEDIUM" || echo "")
       LOW_ISSUES=$(echo "$FILTERED_CONTENT" | grep -B2 -A 20 "ACTIONABLE_LATER" | grep -B2 -A 20 "LOW" || echo "")
 
       if [ "$RETRY_COUNT" -ge 3 ]; then
-        print_info "Also including unresolved ACTIONABLE_NOW items (retry limit reached)..."
+        print_status "Also including unresolved ACTIONABLE_NOW items (retry limit reached)..."
         CRITICAL_ISSUES="$CRITICAL_ISSUES
 $(echo "$FILTERED_CONTENT" | grep -B2 -A 20 "ACTIONABLE_NOW" | grep -B2 -A 20 "CRITICAL" || echo "")"
         HIGH_ISSUES="$HIGH_ISSUES
@@ -1016,11 +1031,11 @@ This approach allows all fixes to be completed together in a focused PR."
     print_success "Follow-up issue #$FOLLOWUP_NUMBER ready for batch processing"
     echo ""
     print_info "Workflow plan:"
-    print_info "  1. Fix issues in #$FOLLOWUP_NUMBER → update PR #$PR_NUMBER"
-    print_info "  2. Wait for new review (up to 15 minutes)"
-    print_info "  3. Merge #$ORIGINAL_ISSUE if review passes"
+    print_status "  1. Fix issues in #$FOLLOWUP_NUMBER → update PR #$PR_NUMBER"
+    print_status "  2. Wait for new review (up to 15 minutes)"
+    print_status "  3. Merge #$ORIGINAL_ISSUE if review passes"
     echo ""
-    print_info "Transitioning to batch workflow..."
+    print_status "Transitioning to batch workflow..."
     echo ""
 
     # EXEC into batch processor (replaces current process)
@@ -1041,7 +1056,8 @@ if [ "$CRITICAL_COUNT" -eq 0 ] && [ "$HIGH_COUNT" -eq 0 ] && [ "$MEDIUM_COUNT" -
 fi
 
 echo "Summary of actions taken:"
-[ "${CREATE_FOLLOWUP_ISSUES:-false}" = true ] && echo "  ✅ Follow-up issues created for HIGH/MEDIUM items"
+[ "${CREATE_FOLLOWUP_ISSUES:-false}" = true ] && [ -n "${FOLLOWUP_NUMBER:-}" ] && echo "  ✅ Follow-up issue #$FOLLOWUP_NUMBER created for HIGH/MEDIUM items"
+[ "${CREATE_FOLLOWUP_ISSUES:-false}" = true ] && [ -z "${FOLLOWUP_NUMBER:-}" ] && echo "  ⚠️  Follow-up issue creation failed (items not tracked)"
 [ "${CREATE_LOW_BATCH:-false}" = true ] && [ "$LOW_COUNT" -gt 0 ] && echo "  ✅ Batched LOW priority items into single issue"
 [ "$CRITICAL_COUNT" -eq 0 ] && [ "$HIGH_COUNT" -eq 0 ] && echo "  ✅ No blocking issues - safe to merge"
 

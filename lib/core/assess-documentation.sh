@@ -107,7 +107,7 @@ echo "📁 Changed Files"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 # Get changed files
-CHANGED_FILES=$(echo "$PR_DATA" | jq -r '.files[].path' | grep -v '^docs/' | head -20)
+CHANGED_FILES=$(echo "$PR_DATA" | jq -r '.files[].path' | grep -v '^docs/' | head -20 || true)
 FILE_COUNT=$(echo "$CHANGED_FILES" | wc -l | xargs)
 
 echo "  Code files changed: $FILE_COUNT"
@@ -121,50 +121,50 @@ DOC_FILES=$(find docs/ -name "*.md" 2>/dev/null | sort || echo "")
 # Get CLAUDE.md sections if it exists
 CLAUDE_MD_SECTIONS=""
 if [ -f "CLAUDE.md" ]; then
-  CLAUDE_MD_SECTIONS=$(grep "^##" CLAUDE.md | head -30)
+  CLAUDE_MD_SECTIONS=$(grep "^##" CLAUDE.md | head -30 || true)
 fi
 
 # Get project README sections if available (configurable per project)
 README_SECTIONS=""
 if [ -n "${RITE_SCRIPTS_README:-}" ] && [ -f "$RITE_SCRIPTS_README" ]; then
-  README_SECTIONS=$(grep "^##" "$RITE_SCRIPTS_README" | head -20)
+  README_SECTIONS=$(grep "^##" "$RITE_SCRIPTS_README" | head -20 || true)
 elif [ -f "README.md" ]; then
-  README_SECTIONS=$(grep "^##" README.md | head -20)
+  README_SECTIONS=$(grep "^##" README.md | head -20 || true)
 fi
 
 # Get table of contents from each major doc to understand coverage
 ARCHITECTURE_DOCS=""
 for doc in docs/architecture/*.md; do
   if [ -f "$doc" ]; then
-    ARCHITECTURE_DOCS="$ARCHITECTURE_DOCS\n$(basename "$doc"): $(grep "^#" "$doc" | head -5 | sed 's/^/  /')"
+    ARCHITECTURE_DOCS="$ARCHITECTURE_DOCS\n$(basename "$doc"): $( (grep "^#" "$doc" || true) | head -5 | sed 's/^/  /')"
   fi
 done
 
 PROJECT_DOCS=""
 for doc in docs/project/*.md; do
   if [ -f "$doc" ]; then
-    PROJECT_DOCS="$PROJECT_DOCS\n$(basename "$doc"): $(grep "^#" "$doc" | head -5 | sed 's/^/  /')"
+    PROJECT_DOCS="$PROJECT_DOCS\n$(basename "$doc"): $( (grep "^#" "$doc" || true) | head -5 | sed 's/^/  /')"
   fi
 done
 
 WORKFLOW_DOCS=""
 for doc in docs/workflows/*.md; do
   if [ -f "$doc" ]; then
-    WORKFLOW_DOCS="$WORKFLOW_DOCS\n$(basename "$doc"): $(grep "^#" "$doc" | head -5 | sed 's/^/  /')"
+    WORKFLOW_DOCS="$WORKFLOW_DOCS\n$(basename "$doc"): $( (grep "^#" "$doc" || true) | head -5 | sed 's/^/  /')"
   fi
 done
 
 SECURITY_DOCS=""
 for doc in docs/security/*.md; do
   if [ -f "$doc" ]; then
-    SECURITY_DOCS="$SECURITY_DOCS\n$(basename "$doc"): $(grep "^#" "$doc" | head -5 | sed 's/^/  /')"
+    SECURITY_DOCS="$SECURITY_DOCS\n$(basename "$doc"): $( (grep "^#" "$doc" || true) | head -5 | sed 's/^/  /')"
   fi
 done
 
 DEVELOPMENT_DOCS=""
 for doc in docs/development/*.md; do
   if [ -f "$doc" ]; then
-    DEVELOPMENT_DOCS="$DEVELOPMENT_DOCS\n$(basename "$doc"): $(grep "^#" "$doc" | head -5 | sed 's/^/  /')"
+    DEVELOPMENT_DOCS="$DEVELOPMENT_DOCS\n$(basename "$doc"): $( (grep "^#" "$doc" || true) | head -5 | sed 's/^/  /')"
   fi
 done
 
@@ -191,7 +191,17 @@ Focus on addressing the specific items mentioned in the review.
 "
 fi
 
-ASSESSMENT_PROMPT=$(cat <<EOF
+# Pre-compute doc structure (avoid nested $() inside heredoc)
+CLAUDE_MD_INLINE=$(echo "$CLAUDE_MD_SECTIONS" | head -10 | tr '\n' ';')
+README_INLINE=""
+if [ -n "$README_SECTIONS" ]; then
+  README_INLINE="- README.md (project overview): $(echo "$README_SECTIONS" | head -10 | tr '\n' ';')"
+fi
+
+# Build assessment prompt in temp file (heredoc inside $() is fragile —
+# PR body content can contain shell metacharacters that break parsing)
+ASSESS_PROMPT_FILE=$(mktemp)
+cat > "$ASSESS_PROMPT_FILE" <<ASSESS_PROMPT_EOF
 You are reviewing a pull request to assess if documentation needs updating.
 
 **PR Title:** $PR_TITLE
@@ -208,8 +218,8 @@ $COMMIT_MESSAGES
 **Existing Documentation Structure:**
 
 Root-level docs:
-- CLAUDE.md (main architecture guide): $(echo "$CLAUDE_MD_SECTIONS" | head -10 | tr '\n' ';')
-$([ -n "$README_SECTIONS" ] && echo "- README.md (project overview): $(echo "$README_SECTIONS" | head -10 | tr '\n' ';')" || echo "")
+- CLAUDE.md (main architecture guide): $CLAUDE_MD_INLINE
+$README_INLINE
 
 docs/architecture/ (system design, infrastructure, database):
 $(echo -e "$ARCHITECTURE_DOCS")
@@ -273,13 +283,13 @@ REASON: <Brief explanation>
 - Refactoring without behavior change
 - Minor version bumps
 - Comment improvements
-EOF
-)
+ASSESS_PROMPT_EOF
 
 print_info "Analyzing documentation requirements..."
 
 # Run assessment
-ASSESSMENT_OUTPUT=$(echo "$ASSESSMENT_PROMPT" | claude --print --dangerously-skip-permissions 2>&1)
+ASSESSMENT_OUTPUT=$(claude --print --dangerously-skip-permissions < "$ASSESS_PROMPT_FILE" 2>&1)
+rm -f "$ASSESS_PROMPT_FILE"
 
 # =============================================================================
 # APPLY UPDATES
@@ -299,7 +309,22 @@ if echo "$ASSESSMENT_OUTPUT" | grep -q "^NEEDS_UPDATE"; then
   echo "  Reason: $REASON"
   echo ""
 
-  if [ "$AUTO_MODE" = "--auto" ]; then
+  # In supervised mode, confirm before applying
+  APPLY_UPDATES=true
+  if [ "$AUTO_MODE" != "--auto" ]; then
+    echo ""
+    read -p "Apply documentation updates? (Y/n): " APPLY_DOCS
+    if [[ "$APPLY_DOCS" =~ ^[Nn]$ ]]; then
+      APPLY_UPDATES=false
+      read -p "Continue with merge without doc updates? (y/N): " CONTINUE
+      if [[ ! "$CONTINUE" =~ ^[Yy]$ ]]; then
+        print_info "Merge cancelled - update documentation first"
+        exit 2
+      fi
+    fi
+  fi
+
+  if [ "$APPLY_UPDATES" = true ]; then
     # Get PR diff for context
     PR_DIFF=$(gh pr diff $PR_NUMBER | head -300)
 
@@ -320,7 +345,8 @@ if echo "$ASSESSMENT_OUTPUT" | grep -q "^NEEDS_UPDATE"; then
 
       CURRENT_CONTENT=$(cat "$doc_file")
 
-      UPDATE_PROMPT=$(cat <<EOF
+      UPDATE_PROMPT_FILE=$(mktemp)
+      cat > "$UPDATE_PROMPT_FILE" <<UPDATE_PROMPT_EOF
 You are updating documentation to reflect code changes from a PR.
 
 **Documentation Update Rule:**
@@ -356,12 +382,13 @@ Update this documentation file to reflect the PR changes. Output the COMPLETE up
 - Update timestamps if present (format: YYYY-MM-DD)
 
 Output ONLY the complete updated markdown file, nothing else.
-EOF
-)
+UPDATE_PROMPT_EOF
 
-      UPDATED_CONTENT=$(echo "$UPDATE_PROMPT" | claude --print --dangerously-skip-permissions 2>&1)
+      CLAUDE_EXIT=0
+      UPDATED_CONTENT=$(claude --print --dangerously-skip-permissions < "$UPDATE_PROMPT_FILE" 2>&1) || CLAUDE_EXIT=$?
+      rm -f "$UPDATE_PROMPT_FILE"
 
-      if [ $? -eq 0 ] && [ -n "$UPDATED_CONTENT" ]; then
+      if [ $CLAUDE_EXIT -eq 0 ] && [ -n "$UPDATED_CONTENT" ]; then
         # Verify update looks reasonable (not truncated)
         ORIGINAL_SIZE=$(echo "$CURRENT_CONTENT" | wc -l)
         NEW_SIZE=$(echo "$UPDATED_CONTENT" | wc -l)
@@ -415,6 +442,13 @@ Related: #$PR_NUMBER"
       if git commit -m "$COMMIT_MSG" 2>/dev/null; then
         echo ""
         echo "  Committed: docs update for PR #$PR_NUMBER"
+
+        # Push doc updates so they're on the PR branch before merge
+        if git push 2>/dev/null; then
+          echo "  Pushed: doc updates included in PR"
+        else
+          print_warning "  Could not push doc updates — they will be local-only"
+        fi
       else
         echo ""
         echo "  Note: No changes to commit (docs may already be up to date)"
@@ -458,14 +492,6 @@ EOF
 
     # Don't block merge - docs are updated (or attempted)
     exit 0
-  else
-    # Interactive mode: ask user
-    echo ""
-    read -p "Continue with merge anyway? (y/N): " CONTINUE
-    if [[ ! "$CONTINUE" =~ ^[Yy]$ ]]; then
-      print_info "Merge cancelled - update documentation first"
-      exit 2
-    fi
   fi
 else
   echo "  Status: No updates needed"

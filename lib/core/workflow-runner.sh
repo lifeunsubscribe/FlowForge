@@ -19,6 +19,7 @@ fi
 source "$RITE_LIB_DIR/utils/notifications.sh"
 source "$RITE_LIB_DIR/utils/blocker-rules.sh"
 source "$RITE_LIB_DIR/utils/session-tracker.sh"
+source "$RITE_LIB_DIR/utils/pr-summary.sh"
 
 # Workflow mode: supervised (requires confirmations) or unsupervised (fully automated)
 WORKFLOW_MODE="${WORKFLOW_MODE:-supervised}"
@@ -64,6 +65,10 @@ print_error() {
 
 print_warning() {
   echo "⚠️  WARNING: $1"
+}
+
+print_status() {
+  echo "$1"
 }
 
 # ===================================================================
@@ -214,8 +219,15 @@ handle_blocker() {
   local blocks_batch=$(is_blocking_batch "$blocker_type")
   local is_batch_mode="${BATCH_MODE:-false}"
 
-  # Save session state (no resume script)
-  save_session_state "$issue_number" "$blocker_type" "$worktree_path"
+  # Save session state WITH phase so resume skips to the right point.
+  # Map blocker context to workflow phase (blockers in pre-merge → resume at merge).
+  local blocker_phase="unknown"
+  case "$context" in
+    pre-merge)  blocker_phase="merge" ;;
+    pre-start)  blocker_phase="claude-workflow" ;;
+    *)          blocker_phase="claude-workflow" ;;
+  esac
+  save_session_state_with_phase "$issue_number" "$blocker_type" "$worktree_path" "$blocker_phase" "$pr_number"
 
   # Helper to send notification (deduped, only when workflow stops or bypasses)
   _send_blocker_notif() {
@@ -505,13 +517,13 @@ EOF
         FILE_CHANGES=$(git diff --name-only origin/main..HEAD 2>/dev/null | wc -l | tr -d ' ')
 
         if [ "$FILE_CHANGES" -gt 0 ]; then
-          print_info "PR #$pr_number has $FILE_CHANGES file(s) changed - skipping to Phase 2"
+          print_info "PR #$pr_number has $FILE_CHANGES file(s) changed — skipping development phase"
           print_success "Development phase complete"
           return 0
         else
           # PR exists but has no real work - need to run development
           print_info "PR #$pr_number exists but has no implementation yet"
-          print_info "Running development phase..."
+          print_status "Running development phase..."
 
           # Call claude-workflow.sh to do the actual development work
           if [ "$WORKFLOW_MODE" = "supervised" ]; then
@@ -631,6 +643,25 @@ phase_create_pr() {
     return 1
   fi
 
+  # Check if a valid REVIEW already exists (newer than latest commit).
+  # If so, skip the entire PR phase — nothing to push, nothing to review.
+  # IMPORTANT: Only match actual review comments (sharkrite-local-review marker),
+  # NOT assessment comments (sharkrite-assessment marker) or other bot comments.
+  # Previously, matching by author alone caused assessment comments to be counted
+  # as "current reviews," skipping review regeneration after fix commits.
+  local review_check=$(gh pr view "$PR_NUMBER" --json comments,commits --jq '
+    (.commits[-1].committedDate // "") as $commit_time |
+    [.comments[] | select(
+      (.body | contains("<!-- sharkrite-local-review")) and
+      (.createdAt > $commit_time)
+    )] | length
+  ' 2>/dev/null || echo "0")
+
+  if [ "${review_check:-0}" -gt 0 ]; then
+    print_info "PR #$PR_NUMBER already has a current review — skipping push/review phase"
+    return 0
+  fi
+
   # Call create-pr.sh (pushes commits if needed, waits for review to appear)
   # Does NOT run assessment - that happens in Phase 3
   # create-pr.sh may exit with code 10 if early blocker detection triggers
@@ -662,6 +693,38 @@ phase_assess_and_resolve() {
   CURRENT_RETRY="$retry_count"
 
   print_header "Phase 3: Assess Review and Resolve Issues"
+
+  # Check if a passing assessment already exists (idempotency on resume).
+  # Only check on first entry (retry_count=0) — retries should always re-assess.
+  if [ "$retry_count" -eq 0 ]; then
+    # Fetch assessment AND check for existing follow-up issue marker in one call
+    local pr_assess_state=$(gh pr view "$pr_number" --json comments --jq '{
+      assessment: ([.comments[] | select(.body | contains("<!-- sharkrite-assessment"))] |
+        sort_by(.createdAt) | reverse | .[0].body // ""),
+      has_followup: ([.comments[] | select(.body | contains("sharkrite-followup-issue:"))] | length > 0)
+    }' 2>/dev/null || echo "{}")
+
+    local existing_assessment=$(echo "$pr_assess_state" | jq -r '.assessment // ""' 2>/dev/null)
+    local has_followup=$(echo "$pr_assess_state" | jq -r '.has_followup // false' 2>/dev/null)
+
+    if [ -n "$existing_assessment" ] && [ "$existing_assessment" != "" ]; then
+      local existing_actionable=$(echo "$existing_assessment" | grep -c "^### .* - ACTIONABLE_NOW" || true)
+      local existing_later=$(echo "$existing_assessment" | grep -c "^### .* - ACTIONABLE_LATER" || true)
+
+      if [ "$existing_actionable" -eq 0 ]; then
+        # Assessment passes — but check if ACTIONABLE_LATER items need tech-debt issues
+        if [ "$existing_later" -gt 0 ] && [ "$has_followup" != "true" ]; then
+          print_info "Assessment passes but $existing_later ACTIONABLE_LATER items need tech-debt issues — running Phase 3"
+        else
+          print_info "PR #$pr_number already has a passing assessment (0 ACTIONABLE_NOW) — skipping assessment phase"
+          [ "$existing_later" -gt 0 ] && print_status "  ($existing_later ACTIONABLE_LATER items already have follow-up issues)"
+          return 0
+        fi
+      else
+        print_info "Existing assessment has $existing_actionable ACTIONABLE_NOW items — re-entering fix loop"
+      fi
+    fi
+  fi
 
   if [ $retry_count -gt 0 ]; then
     print_info "Retry attempt $retry_count of $max_retries"
@@ -709,7 +772,7 @@ phase_assess_and_resolve() {
 
   # Show assessment header with progress indicator
   print_header "📊 PR Review Assessment"
-  print_info "Analyzing PR #$pr_number for issue #$issue_number..."
+  print_status "Analyzing PR #$pr_number for issue #$issue_number..."
   local assess_start_time=$(date +%s)
 
   set +e  # Temporarily disable exit-on-error to capture exit code properly
@@ -755,9 +818,9 @@ phase_assess_and_resolve() {
 
     if [ $now_count -gt 0 ] || [ $later_count -gt 0 ] || [ $dismissed_count -gt 0 ]; then
       print_info "Decision breakdown:"
-      print_info "  • ACTIONABLE_NOW: $now_count items (fixing in this PR)"
-      [ $later_count -gt 0 ] && print_info "  • ACTIONABLE_LATER: $later_count items (deferred)"
-      [ $dismissed_count -gt 0 ] && print_info "  • DISMISSED: $dismissed_count items (ignored)"
+      print_status "  • ACTIONABLE_NOW: $now_count items (fixing in this PR)"
+      [ $later_count -gt 0 ] && print_status "  • ACTIONABLE_LATER: $later_count items (deferred)"
+      [ $dismissed_count -gt 0 ] && print_status "  • DISMISSED: $dismissed_count items (ignored)"
     fi
 
     # Check if we've hit max retries
@@ -846,6 +909,37 @@ phase_merge_pr() {
   print_header "Phase 4: Merge PR and Update Docs"
 
   cd "$WORKTREE_PATH"
+
+  # Show a brief changes summary so the user knows what's about to be merged
+  local _pr_info=$(gh pr view "$pr_number" --json title,body 2>/dev/null || echo "{}")
+  local _pr_title=$(echo "$_pr_info" | jq -r '.title // ""')
+  local _pr_body=$(echo "$_pr_info" | jq -r '.body // ""')
+
+  if [ -n "$_pr_title" ]; then
+    echo ""
+    echo "📋 PR #$pr_number: $_pr_title"
+
+    local _summary
+    _summary=$(extract_changes_summary "$_pr_body" 2>/dev/null) || _summary=""
+
+    if [ -n "$_summary" ]; then
+      # Display the marked section (skip the "## Changes" header — we have our own chrome)
+      echo "$_summary" | grep -v "^## Changes" | grep -v "^### Commits" | grep -v "^$" | head -15 | sed 's/^/   /'
+    else
+      # Fallback for PRs created before this change
+      local _changed_files=$(gh pr view "$pr_number" --json files --jq '.files[].path' 2>/dev/null || echo "")
+      local _file_count=$(echo "$_changed_files" | grep -c '.' || true)
+      local _commit_count=$(gh pr view "$pr_number" --json commits --jq '.commits | length' 2>/dev/null || echo "?")
+      echo "   $_file_count file(s), $_commit_count commit(s)"
+      if [ "$_file_count" -le 10 ] && [ -n "$_changed_files" ]; then
+        echo "$_changed_files" | sed 's/^/   • /'
+      else
+        echo "$_changed_files" | head -8 | sed 's/^/   • /'
+        echo "   ... and $((_file_count - 8)) more"
+      fi
+    fi
+    echo ""
+  fi
 
   # Pre-merge blocker gate: check for infrastructure, auth, migration changes etc.
   # This runs AFTER review/assessment so the user has full context for the decision.
@@ -1022,52 +1116,30 @@ run_workflow() {
         fi
       fi
 
-      # Generate qualitative summary using Claude CLI
-      echo ""
-      echo "What was accomplished:"
+      # Show changes summary from PR body (single source of truth)
+      local _pr_body_text=$(echo "$pr_data" | jq -r '.body // ""')
+      local _summary
+      _summary=$(extract_changes_summary "$_pr_body_text" 2>/dev/null) || _summary=""
 
-      if command -v claude &> /dev/null; then
-        # Get PR diff for context
-        local pr_diff=$(gh pr diff "$pr_number" 2>/dev/null | head -100)
+      if [ -n "$_summary" ]; then
+        echo ""
+        echo "$_summary" | grep -v "^## Changes" | grep -v "^### Commits" | sed 's/^/  /'
+      else
+        # Fallback for PRs created before the marked-section change
+        local _changed_files=$(gh pr view "$pr_number" --json files --jq '.files[].path' 2>/dev/null || echo "")
+        local _file_count=$(echo "$_changed_files" | grep -c '.' || true)
+        local _commit_count=$(gh pr view "$pr_number" --json commits --jq '.commits | length' 2>/dev/null || echo "?")
 
-        # Use Claude to generate concise summary
-        local summary_prompt=$(cat <<EOF
-Analyze this pull request and provide a single sentence (max 20 words) describing what was accomplished.
-
-Title: $issue_title
-Files changed: $(gh pr view "$pr_number" --json files --jq '.files | length' 2>/dev/null) files
-
-Focus on the user-facing impact or technical improvement, not implementation details.
-Be specific and concise. Examples:
-- "Added inline documentation explaining test coverage exclusion patterns"
-- "Fixed authentication bug causing intermittent login failures"
-- "Refactored database queries to improve performance by 40%"
-
-Your turn - one sentence only:
-EOF
-)
-
-        local claude_summary=$(echo "$summary_prompt" | claude --no-cache 2>/dev/null | head -1)
-
-        if [ -n "$claude_summary" ]; then
-          echo "  $claude_summary"
-        else
-          # Fallback to title
-          echo "  $issue_title"
+        echo ""
+        echo "Changes: $_file_count file(s), $_commit_count commit(s)"
+        if [ "$_file_count" -gt 0 ] && [ -n "$_changed_files" ]; then
+          if [ "$_file_count" -le 10 ]; then
+            echo "$_changed_files" | sed 's/^/  • /'
+          else
+            echo "$_changed_files" | head -8 | sed 's/^/  • /'
+            echo "  ... and $((_file_count - 8)) more"
+          fi
         fi
-      else
-        # Fallback to title if Claude unavailable
-        echo "  $issue_title"
-      fi
-
-      # Show file changes
-      echo ""
-      echo "Files changed:"
-      local pr_files=$(gh pr view "$pr_number" --json files --jq '.files[] | "  • \(.path) (\(.additions)+/\(.deletions)-)"' 2>/dev/null)
-      if [ -n "$pr_files" ]; then
-        echo "$pr_files"
-      else
-        echo "  (file list unavailable)"
       fi
     fi
 
@@ -1077,56 +1149,168 @@ EOF
     echo "Nothing to do - issue already complete! 🎉"
     echo ""
 
-    return 0
-  fi
+    # =========================================================================
+    # CLEANUP DANGLING ARTIFACTS
+    # =========================================================================
+    # If a previous run crashed mid-merge or was interrupted, artifacts
+    # (worktrees, branches, session state) may still exist. Clean them up.
 
-  # Determine starting phase based on resume state
-  # Phase order: pre-start -> claude-workflow -> create-pr -> assess-resolve -> merge -> completion
-  local skip_to_phase=""
-  if [ "$RESUME_MODE" = true ] && [ -n "${RESUME_PHASE:-}" ]; then
-    case "$RESUME_PHASE" in
-      pre-start|phase-0)
-        skip_to_phase=""  # Start from beginning
-        ;;
-      claude-workflow|phase-1)
-        skip_to_phase="claude-workflow"
-        print_info "Resuming from phase 1 (Sharkrite workflow)"
-        ;;
-      create-pr|phase-2)
-        skip_to_phase="create-pr"
-        print_info "Resuming from phase 2 (Create PR)"
-        ;;
-      assess-resolve|phase-3)
-        skip_to_phase="assess-resolve"
-        print_info "Resuming from phase 3 (Assess & Resolve)"
-        ;;
-      merge|phase-4)
-        skip_to_phase="merge"
-        print_info "Resuming from phase 4 (Merge)"
-        ;;
-      *)
-        print_warning "Unknown resume phase: $RESUME_PHASE - starting from beginning"
-        ;;
-    esac
+    if [ -n "$pr_branch" ]; then
+      local cleaned_anything=false
 
-    # If resuming to phase 3+ and we don't have PR_NUMBER, detect it from the branch
-    if [ "$skip_to_phase" = "assess-resolve" ] || [ "$skip_to_phase" = "merge" ]; then
-      if [ -z "${PR_NUMBER:-}" ]; then
-        cd "$WORKTREE_PATH" 2>/dev/null || true
-        local branch_name=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
-        if [ -n "$branch_name" ]; then
-          PR_NUMBER=$(gh pr view "$branch_name" --json number --jq '.number' 2>/dev/null || echo "")
-          if [ -n "$PR_NUMBER" ]; then
-            CURRENT_PR="$PR_NUMBER"
-            export PR_NUMBER
-            print_info "Detected existing PR: #$PR_NUMBER"
-          else
-            print_error "Cannot resume to phase 3+ without a PR"
-            print_info "Branch '$branch_name' has no associated PR"
-            return 1
+      # 1. Remove worktree if it exists for this branch
+      local wt_path=$(git worktree list | grep "\[$pr_branch\]" | awk '{print $1}')
+      if [ -n "$wt_path" ]; then
+        # Safety: check if other worktrees are actively in use (batch run)
+        local active_worktrees=0
+        local other_worktrees=$(git worktree list --porcelain | grep -E "^worktree ${RITE_WORKTREE_DIR:-__none__}" | sed 's/^worktree //' | grep -v "^$wt_path$" || echo "")
+        if [ -n "$other_worktrees" ]; then
+          while IFS= read -r other_wt; do
+            [ -z "$other_wt" ] && continue
+            local other_uncommitted=$(git -C "$other_wt" status --porcelain 2>/dev/null | grep -vE "^\?\?" | wc -l | tr -d ' ')
+            if [ "$other_uncommitted" -gt 0 ]; then
+              active_worktrees=$((active_worktrees + 1))
+            fi
+          done <<< "$other_worktrees"
+        fi
+
+        if [ "$active_worktrees" -gt 0 ]; then
+          print_warning "Skipping worktree cleanup — $active_worktrees other active worktree(s) detected (batch run?)"
+        else
+          if git worktree remove "$wt_path" --force 2>/dev/null; then
+            [ "$cleaned_anything" = false ] && echo "🧹 Cleaning up artifacts:" && cleaned_anything=true
+            print_success "  Removed worktree: $(basename "$wt_path")"
           fi
         fi
       fi
+
+      # 2. Delete local branch if it still exists
+      if git show-ref --verify --quiet "refs/heads/$pr_branch" 2>/dev/null; then
+        if git branch -D "$pr_branch" 2>/dev/null; then
+          [ "$cleaned_anything" = false ] && echo "🧹 Cleaning up artifacts:" && cleaned_anything=true
+          print_success "  Deleted local branch: $pr_branch"
+        fi
+      fi
+
+      # 3. Delete remote branch if it still exists
+      if git ls-remote --heads origin "$pr_branch" 2>/dev/null | grep -q "$pr_branch"; then
+        if git push origin --delete "$pr_branch" 2>/dev/null; then
+          [ "$cleaned_anything" = false ] && echo "🧹 Cleaning up artifacts:" && cleaned_anything=true
+          print_success "  Deleted remote branch: origin/$pr_branch"
+        fi
+      fi
+
+      # 4. Remove session state file for this issue
+      local state_file="${RITE_PROJECT_ROOT}/${RITE_DATA_DIR}/session-state-${issue_number}.json"
+      if [ -f "$state_file" ]; then
+        rm -f "$state_file"
+        [ "$cleaned_anything" = false ] && echo "🧹 Cleaning up artifacts:" && cleaned_anything=true
+        print_success "  Removed session state: session-state-${issue_number}.json"
+      fi
+
+      if [ "$cleaned_anything" = true ]; then
+        echo ""
+      fi
+    fi
+
+    return 0
+  fi
+
+  # Determine starting phase by inspecting actual PR state (not just saved file).
+  # The workflow is idempotent: each run checks what's done and picks up where needed.
+  # Phase order: pre-start -> claude-workflow -> create-pr -> assess-resolve -> merge
+  local skip_to_phase=""
+
+  # If resuming and we have a worktree, detect PR and inspect its state
+  if [ "$RESUME_MODE" = true ] && [ -n "$WORKTREE_PATH" ] && [ -d "$WORKTREE_PATH" ]; then
+    # Detect PR number from branch if not already set
+    if [ -z "${PR_NUMBER:-}" ]; then
+      cd "$WORKTREE_PATH" 2>/dev/null || true
+      local branch_name=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+      if [ -n "$branch_name" ]; then
+        PR_NUMBER=$(gh pr list --head "$branch_name" --json number --jq '.[0].number' 2>/dev/null || echo "")
+        if [ -n "$PR_NUMBER" ] && [ "$PR_NUMBER" != "null" ]; then
+          CURRENT_PR="$PR_NUMBER"
+          export PR_NUMBER
+        fi
+      fi
+    fi
+
+    # Inspect PR comments to determine what work is already done
+    if [ -n "${PR_NUMBER:-}" ] && [ "$PR_NUMBER" != "null" ]; then
+      print_status "Inspecting PR #$PR_NUMBER state..."
+
+      # Get latest commit time, review/assessment comments, and follow-up markers in one API call
+      local pr_state_json=$(gh pr view "$PR_NUMBER" --json comments,commits --jq '{
+        latest_commit: (.commits[-1].committedDate // ""),
+        latest_review: ([.comments[] | select(
+          .author.login == "claude" or .author.login == "claude[bot]" or
+          .author.login == "github-actions[bot]" or
+          (.body | contains("<!-- sharkrite-local-review"))
+        )] | sort_by(.createdAt) | reverse | .[0].createdAt // ""),
+        latest_assessment: ([.comments[] | select(
+          .body | contains("<!-- sharkrite-assessment")
+        )] | sort_by(.createdAt) | reverse | .[0].body // ""),
+        has_followup: ([.comments[] | select(
+          .body | contains("sharkrite-followup-issue:")
+        )] | length > 0)
+      }' 2>/dev/null || echo "{}")
+
+      local pr_latest_commit=$(echo "$pr_state_json" | jq -r '.latest_commit // ""' 2>/dev/null)
+      local pr_latest_review=$(echo "$pr_state_json" | jq -r '.latest_review // ""' 2>/dev/null)
+      local pr_latest_assessment=$(echo "$pr_state_json" | jq -r '.latest_assessment // ""' 2>/dev/null)
+      local pr_has_followup=$(echo "$pr_state_json" | jq -r '.has_followup // false' 2>/dev/null)
+
+      # Determine state: review current? assessment exists? assessment approves?
+      local review_is_current=false
+      if [ -n "$pr_latest_review" ] && [ -n "$pr_latest_commit" ]; then
+        # ISO timestamp comparison works lexicographically
+        if [[ "$pr_latest_review" > "$pr_latest_commit" ]]; then
+          review_is_current=true
+        fi
+      fi
+
+      if [ "$review_is_current" = true ] && [ -n "$pr_latest_assessment" ]; then
+        # Assessment exists — does it approve?
+        local actionable_now=$(echo "$pr_latest_assessment" | grep -c "^### .* - ACTIONABLE_NOW" || true)
+        local actionable_later=$(echo "$pr_latest_assessment" | grep -c "^### .* - ACTIONABLE_LATER" || true)
+
+        if [ "$actionable_now" -eq 0 ]; then
+          # Check: if ACTIONABLE_LATER items exist, tech-debt issues must be created first
+          if [ "$actionable_later" -gt 0 ] && [ "$pr_has_followup" != "true" ]; then
+            skip_to_phase="assess-resolve"
+            print_info "PR state: assessment passes but $actionable_later ACTIONABLE_LATER items need tech-debt issues"
+          else
+            skip_to_phase="merge"
+            print_info "PR state: review current, assessment passes → skipping to merge"
+          fi
+        else
+          skip_to_phase="assess-resolve"
+          print_info "PR state: assessment has $actionable_now ACTIONABLE_NOW items → entering fix loop"
+        fi
+      elif [ "$review_is_current" = true ]; then
+        skip_to_phase="assess-resolve"
+        print_info "PR state: review current, no assessment → running assessment"
+      else
+        # No current review — Phase 2 will handle it
+        # (Phase 1 will also check if dev work exists)
+        print_info "PR state: no current review → running from development"
+      fi
+    fi
+  fi
+
+  # Show skip summary when resuming past earlier phases
+  if [ -n "$skip_to_phase" ]; then
+    print_header "Resume Summary"
+    if [ "$skip_to_phase" = "merge" ]; then
+      print_success "Phase 1: Development — complete"
+      print_success "Phase 2: Push & PR — PR #${PR_NUMBER} open"
+      print_success "Phase 3: Review & Assessment — all items resolved"
+    elif [ "$skip_to_phase" = "assess-resolve" ]; then
+      print_success "Phase 1: Development — complete"
+      print_success "Phase 2: Push & PR — PR #${PR_NUMBER} open"
+    elif [ "$skip_to_phase" = "create-pr" ]; then
+      print_success "Phase 1: Development — complete"
     fi
   fi
 
@@ -1294,9 +1478,9 @@ main() {
       fi
 
       print_success "Resuming from phase: ${saved_phase:-unknown}"
-      print_info "Worktree: $WORKTREE_PATH"
-      [ -n "$CURRENT_PR" ] && print_info "PR: #$CURRENT_PR"
-      [ "$RESUME_RETRY" -gt 0 ] && print_info "Retry: $RESUME_RETRY/3"
+      print_status "Worktree: $WORKTREE_PATH"
+      [ -n "$CURRENT_PR" ] && print_status "PR: #$CURRENT_PR"
+      [ "$RESUME_RETRY" -gt 0 ] && print_status "Retry: $RESUME_RETRY/3"
     else
       print_warning "Saved worktree no longer exists - starting fresh"
     fi

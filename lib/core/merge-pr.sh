@@ -79,6 +79,10 @@ print_info() {
   echo -e "${BLUE}ℹ️  $1${NC}"
 }
 
+print_status() {
+  echo -e "${BLUE}$1${NC}"
+}
+
 # Helper: Add or update "Last Updated" timestamp in documentation
 update_doc_timestamp() {
   local doc_path="$1"
@@ -147,7 +151,7 @@ update_security_guide_from_pr() {
     return 0
   fi
 
-  print_info "Checking for security findings in PR #$pr_number..."
+  print_status "Checking for security findings in PR #$pr_number..."
 
   # Extract Claude review comments (check multiple possible bot names)
   REVIEW_COMMENTS=$(gh pr view $pr_number --json comments --jq '.comments[] | select(.author.login | test("claude"; "i")) | .body' 2>/dev/null || echo "")
@@ -163,7 +167,7 @@ update_security_guide_from_pr() {
   fi
 
   print_warning "Security findings detected in PR #$pr_number"
-  print_info "Analyzing findings against existing security guide..."
+  print_status "Analyzing findings against existing security guide..."
 
   # Use Sharkrite to analyze and update guide
   CLAUDE_CMD="claude"
@@ -238,7 +242,7 @@ ANALYSIS_EOF
   print_success "Security guide analysis complete"
 
   # Apply updates using Sharkrite
-  print_info "Applying updates to security guide..."
+  print_status "Applying updates to security guide..."
 
   # Use temp files to avoid command injection
   UPDATE_TEMP=$(mktemp)
@@ -341,7 +345,7 @@ fi
 
 # Fetch PR details
 if [ "$AUTO_MODE" = false ]; then
-  print_info "Fetching PR details..."
+  print_status "Fetching PR details..."
 fi
 PR_DETAILS=$(gh pr view $PR_NUMBER --json number,title,state,isDraft,mergeable,url,baseRefName,headRefName,statusCheckRollup 2>/dev/null)
 
@@ -371,9 +375,7 @@ if [ "$AUTO_MODE" = false ]; then
 fi
 
 # Validation checks
-if [ "$AUTO_MODE" = false ]; then
-  print_header "🔍 Pre-Merge Validation"
-fi
+print_header "🔍 Pre-Merge Validation"
 
 VALIDATION_FAILED=false
 
@@ -481,8 +483,20 @@ if [ -n "$LATEST_CLAUDE_REVIEW" ] && [ "$LATEST_CLAUDE_REVIEW" != "null" ]; then
   REVIEW_VERDICT=$(echo "$LATEST_CLAUDE_REVIEW" | grep -oiE "Overall Assessment:.*?(APPROVE|NEEDS WORK)" | head -1 || echo "")
 
   if [ "$CRITICAL_COUNT" -gt 0 ]; then
-    print_error "Found $CRITICAL_COUNT CRITICAL issue(s) - must be addressed"
-    VALIDATION_FAILED=true
+    # Check if the assessment already resolved/dismissed all CRITICAL items.
+    # The review shows raw findings; the assessment is the authoritative verdict.
+    ASSESSMENT_ACTIONABLE=$(gh pr view "$PR_NUMBER" --json comments --jq '
+      [.comments[] | select(.body | contains("<!-- sharkrite-assessment"))] |
+      sort_by(.createdAt) | reverse | .[0].body // ""
+    ' 2>/dev/null | grep -c "^### .* - ACTIONABLE_NOW" || true)
+
+    if [ "${ASSESSMENT_ACTIONABLE:-0}" -eq 0 ]; then
+      # Assessment exists and has 0 ACTIONABLE_NOW — CRITICALs were resolved or dismissed
+      print_success "Review has $CRITICAL_COUNT CRITICAL finding(s) but assessment resolved all — OK to merge"
+    else
+      print_error "Found $CRITICAL_COUNT CRITICAL issue(s) - must be addressed"
+      VALIDATION_FAILED=true
+    fi
   elif echo "$REVIEW_VERDICT" | grep -qi "APPROVE"; then
     print_success "Review passed (APPROVE)"
   elif echo "$REVIEW_VERDICT" | grep -qi "NEEDS WORK"; then
@@ -497,8 +511,8 @@ fi
 # Analyze HIGH and MEDIUM issues if review exists
 if [ "$CLAUDE_REVIEW_FOUND" = true ] && [ "$CRITICAL_COUNT" -eq 0 ]; then
   # Extract HIGH and MEDIUM issues
-  HIGH_ISSUES=$(echo "$LATEST_CLAUDE_REVIEW" | sed -n '/### HIGH Priority/,/### MEDIUM\|###.*Priority\|---/p' | grep -v "^###")
-  MEDIUM_ISSUES=$(echo "$LATEST_CLAUDE_REVIEW" | sed -n '/### MEDIUM Priority/,/### LOW\|###.*Priority\|---/p' | grep -v "^###")
+  HIGH_ISSUES=$(echo "$LATEST_CLAUDE_REVIEW" | sed -n '/### HIGH Priority/,/### MEDIUM\|###.*Priority\|---/p' | grep -v "^###" || true)
+  MEDIUM_ISSUES=$(echo "$LATEST_CLAUDE_REVIEW" | sed -n '/### MEDIUM Priority/,/### LOW\|###.*Priority\|---/p' | grep -v "^###" || true)
 
   HIGH_COUNT=$(echo "$LATEST_CLAUDE_REVIEW" | grep -oiE 'HIGH[[:space:]:]+\(?[0-9]+\)?' | grep -oE '[0-9]+' | head -1)
   MEDIUM_COUNT=$(echo "$LATEST_CLAUDE_REVIEW" | grep -oiE 'MEDIUM[[:space:]:]+\(?[0-9]+\)?' | grep -oE '[0-9]+' | head -1)
@@ -586,7 +600,7 @@ EOF
         echo ""
         echo "To view issues in detail:"
           echo "  gh pr view $PR_NUMBER --web"
-        exit 0
+        exit 1
       fi
     else
       print_info "Auto mode: proceeding with merge (HIGH/MEDIUM issues are non-blocking)"
@@ -597,9 +611,7 @@ fi
 # Summary of validation
 echo ""
 if [ "$VALIDATION_FAILED" = true ]; then
-  if [ "$AUTO_MODE" = false ]; then
-    print_header "❌ Validation Failed"
-  fi
+  print_header "❌ Validation Failed"
   echo "The following issues must be resolved before merging:"
   echo ""
   echo "Please address the errors above and try again."
@@ -609,29 +621,30 @@ if [ "$VALIDATION_FAILED" = true ]; then
   exit 1
 fi
 
-if [ "$AUTO_MODE" = false ]; then
-  print_header "✅ All Validations Passed"
-  echo "  • PR state: open, not draft, mergeable"
-  echo "  • Status checks: ${REQUIRED_CHECKS_COUNT:-0} required (all passed)"
-  echo "  • Sharkrite review: $([ "$CLAUDE_REVIEW_FOUND" = true ] && echo "passed" || echo "not required")"
-  echo ""
-fi
+print_header "✅ All Validations Passed"
+echo "  • PR state: open, not draft, mergeable"
+echo "  • Status checks: ${REQUIRED_CHECKS_COUNT:-0} required (all passed)"
+echo "  • Sharkrite review: $([ "$CLAUDE_REVIEW_FOUND" = true ] && echo "passed" || echo "not required")"
+echo ""
 
-# Documentation completeness check
-print_header "📚 Documentation Assessment"
+# Documentation completeness check (header printed by the script itself)
 DOC_ASSESSMENT_SCRIPT="$RITE_LIB_DIR/core/assess-documentation.sh"
 
 if [ -f "$DOC_ASSESSMENT_SCRIPT" ]; then
+  DOC_EXIT_CODE=0
   if [ "$AUTO_MODE" = true ]; then
-    "$DOC_ASSESSMENT_SCRIPT" "$PR_NUMBER" --auto
+    "$DOC_ASSESSMENT_SCRIPT" "$PR_NUMBER" --auto || DOC_EXIT_CODE=$?
   else
-    "$DOC_ASSESSMENT_SCRIPT" "$PR_NUMBER"
+    "$DOC_ASSESSMENT_SCRIPT" "$PR_NUMBER" || DOC_EXIT_CODE=$?
   fi
 
-  DOC_EXIT_CODE=$?
-
   if [ $DOC_EXIT_CODE -ne 0 ]; then
-    # Assessment script failed
+    if [ $DOC_EXIT_CODE -eq 2 ]; then
+      # User explicitly cancelled in the doc assessment prompt
+      print_info "Merge cancelled"
+      exit 1
+    fi
+    # Assessment script failed unexpectedly
     print_warning "Documentation assessment failed (error code $DOC_EXIT_CODE)"
     if [ "$AUTO_MODE" = true ]; then
       print_warning "Auto mode: proceeding with merge (docs can be updated manually)"
@@ -639,7 +652,7 @@ if [ -f "$DOC_ASSESSMENT_SCRIPT" ]; then
       read -p "Continue with merge anyway? (y/N): " CONTINUE
       if [[ ! "$CONTINUE" =~ ^[Yy]$ ]]; then
         print_info "Merge cancelled"
-        exit 0
+        exit 1
       fi
     fi
   fi
@@ -658,68 +671,11 @@ if [ "$AUTO_MODE" = false ]; then
   echo
   if [[ ! $REPLY =~ ^[Yy]$ ]]; then
     print_info "Merge cancelled"
-    exit 0
+    exit 1
   fi
 
-  # Analyze PR characteristics for merge strategy recommendation
-  COMMIT_COUNT=$(gh pr view $PR_NUMBER --json commits --jq '.commits | length' 2>/dev/null || echo "1")
-  CHANGED_FILES=$(gh pr view $PR_NUMBER --json files --jq '.files | length' 2>/dev/null || echo "0")
-  PR_LABELS=$(gh pr view $PR_NUMBER --json labels --jq '[.labels[].name] | join(",")' 2>/dev/null || echo "")
-
-  # Determine recommendation
-  RECOMMENDED_STRATEGY=1  # Default to squash
-  RECOMMENDATION_REASON="Clean single commit"
-
-  if [ "$COMMIT_COUNT" -gt 10 ] && echo "$PR_LABELS" | grep -qiE "(refactor|feature)"; then
-    RECOMMENDED_STRATEGY=2
-    RECOMMENDATION_REASON="Large feature - preserve commit history"
-  elif [ "$COMMIT_COUNT" -eq 1 ]; then
-    RECOMMENDED_STRATEGY=1
-    RECOMMENDATION_REASON="Single commit - squash keeps history clean"
-  elif echo "$PR_LABELS" | grep -qiE "(hotfix|fix)" && [ "$COMMIT_COUNT" -le 3 ]; then
-    RECOMMENDED_STRATEGY=1
-    RECOMMENDATION_REASON="Quick fix - squash for cleaner history"
-  elif echo "$PR_TITLE" | grep -qiE "^(feat|feature):" && [ "$COMMIT_COUNT" -gt 5 ]; then
-    RECOMMENDED_STRATEGY=2
-    RECOMMENDATION_REASON="Feature with detailed commit history"
-  fi
-
-  # Merge strategy prompt with smart recommendation
-  echo ""
-  echo "Select merge strategy:"
-  echo ""
-  echo "PR Stats: $COMMIT_COUNT commits, $CHANGED_FILES files changed"
-  echo ""
-  if [ "$RECOMMENDED_STRATEGY" -eq 1 ]; then
-    echo "  1) Squash and merge ⭐ RECOMMENDED"
-    echo "     → $RECOMMENDATION_REASON"
-  else
-    echo "  1) Squash and merge"
-    echo "     → Clean single commit"
-  fi
-  echo ""
-  if [ "$RECOMMENDED_STRATEGY" -eq 2 ]; then
-    echo "  2) Merge commit ⭐ RECOMMENDED"
-    echo "     → $RECOMMENDATION_REASON"
-  else
-    echo "  2) Merge commit"
-    echo "     → Preserves all commits"
-  fi
-  echo ""
-  if [ "$RECOMMENDED_STRATEGY" -eq 3 ]; then
-    echo "  3) Rebase and merge ⭐ RECOMMENDED"
-    echo "     → $RECOMMENDATION_REASON"
-  else
-    echo "  3) Rebase and merge"
-    echo "     → Linear history"
-  fi
-  echo ""
-  read -p "Enter choice (1-3) [$RECOMMENDED_STRATEGY]: " MERGE_STRATEGY
-
-  MERGE_STRATEGY=${MERGE_STRATEGY:-$RECOMMENDED_STRATEGY}
+  MERGE_STRATEGY=1
 else
-  # Auto mode: use squash by default
-  print_info "Auto mode: using squash merge"
   MERGE_STRATEGY=1
 fi
 
@@ -768,7 +724,7 @@ if [ $MERGE_EXIT_CODE -eq 0 ]; then
 
   # Delete remote branch manually (since we didn't use --delete-branch flag)
   echo ""
-  print_info "Cleaning up remote branch..."
+  print_status "Cleaning up remote branch..."
   sleep 2  # Give GitHub a moment to process the merge
 
   if git ls-remote --heads origin "$PR_HEAD" 2>/dev/null | grep -q "$PR_HEAD"; then
@@ -828,19 +784,21 @@ if [ $MERGE_EXIT_CODE -eq 0 ]; then
   echo ""
   echo -e "${BLUE}📋 Follow-up Issues${NC}"
 
-  # Check if assessment already created issues (look in PR body)
-  PR_BODY=$(gh pr view "$PR_NUMBER" --json body --jq '.body' 2>/dev/null || echo "")
-  ASSESSMENT_ISSUES=$(echo "$PR_BODY" | grep -oE "#[0-9]+" | sort -u || echo "")
+  # Find follow-up issues via the machine-readable marker that assess-and-resolve.sh
+  # adds as a PR comment: <!-- sharkrite-followup-issue:N -->
+  # This is more reliable than scanning the PR body for #N patterns, which
+  # matches the linked issue itself (Closes #N) and random references.
+  ASSESSMENT_ISSUES=$(gh pr view "$PR_NUMBER" --json comments --jq '.comments[].body' 2>/dev/null | grep -oE 'sharkrite-followup-issue:([0-9]+)' | grep -oE '[0-9]+' | sort -u || echo "")
 
   if [ -n "$ASSESSMENT_ISSUES" ]; then
     ISSUE_COUNT=$(echo "$ASSESSMENT_ISSUES" | wc -l | tr -d ' ')
     print_success "Assessment created $ISSUE_COUNT follow-up issue(s)"
-    echo "  Issues: $(echo $ASSESSMENT_ISSUES | tr '\n' ' ')"
+    echo "  Issues: $(echo $ASSESSMENT_ISSUES | sed 's/^/#/' | tr '\n' ' ')"
 
     # Send Slack notification with merge summary
     if [ -n "${SLACK_WEBHOOK:-}" ]; then
       ISSUES_LIST=""
-      for issue_num in $(echo "$ASSESSMENT_ISSUES" | tr -d '#'); do
+      for issue_num in $ASSESSMENT_ISSUES; do
         ISSUE_TITLE=$(gh issue view "$issue_num" --json title --jq '.title' 2>/dev/null || echo "Issue #$issue_num")
         REPO_URL=$(gh repo view --json url --jq '.url' 2>/dev/null || echo "")
         ISSUES_LIST="${ISSUES_LIST}• <${REPO_URL}/issues/${issue_num}|#${issue_num}>: ${ISSUE_TITLE}\n"
@@ -897,30 +855,44 @@ EOF
 
   # Cleanup local branch if it exists
   if [ "$CURRENT_BRANCH" = "$PR_HEAD" ]; then
-    print_info "You are currently on the merged branch"
-    echo ""
-    read -p "Switch to $PR_BASE and delete local branch? (y/n) " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-      git checkout $PR_BASE
-      git pull origin $PR_BASE
+    if [ "$AUTO_MODE" = true ]; then
+      # Auto mode: just delete the local branch. Don't try git checkout —
+      # in a worktree, main is checked out elsewhere and checkout fails with
+      # "fatal: 'main' is already used by worktree". The orchestrator handles
+      # worktree removal separately.
       git branch -D $PR_HEAD 2>/dev/null || true
-      print_success "Switched to $PR_BASE and deleted local branch"
+      print_success "Deleted local branch: $PR_HEAD"
+    else
+      print_info "You are currently on the merged branch"
+      echo ""
+      read -p "Switch to $PR_BASE and delete local branch? (y/n) " -n 1 -r
+      echo
+      if [[ $REPLY =~ ^[Yy]$ ]]; then
+        git checkout $PR_BASE 2>/dev/null || print_warning "Could not switch to $PR_BASE (may be checked out in another worktree)"
+        git pull origin $PR_BASE 2>/dev/null || true
+        git branch -D $PR_HEAD 2>/dev/null || true
+        print_success "Switched to $PR_BASE and deleted local branch"
+      fi
     fi
   elif git branch --list | grep -q "^  $PR_HEAD\$"; then
-    print_info "Local branch $PR_HEAD still exists"
-    echo ""
-    read -p "Delete local branch? (y/n) " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
+    if [ "$AUTO_MODE" = true ]; then
       git branch -D $PR_HEAD 2>/dev/null || true
-      print_success "Local branch deleted"
+      print_success "Deleted local branch: $PR_HEAD"
+    else
+      print_info "Local branch $PR_HEAD still exists"
+      echo ""
+      read -p "Delete local branch? (y/n) " -n 1 -r
+      echo
+      if [[ $REPLY =~ ^[Yy]$ ]]; then
+        git branch -D $PR_HEAD 2>/dev/null || true
+        print_success "Local branch deleted"
+      fi
     fi
   fi
 
   # Pop stash if there are stashed changes (from claude-workflow.sh)
   if git stash list | grep -q "Auto-stash before claude-workflow.sh"; then
-    print_info "Restoring stashed changes..."
+    print_status "Restoring stashed changes..."
     if git stash pop; then
       print_success "Stashed changes restored"
     else
@@ -939,7 +911,7 @@ EOF
 
       # Clean up only this branch's notes from shared scratchpad
       if [ -f "$SCRATCHPAD_FILE" ]; then
-        print_info "Cleaning up notes for branch: $PR_HEAD..."
+        print_status "Cleaning up notes for branch: $PR_HEAD..."
 
         # Create backup before modification
         SCRATCHPAD_BACKUP="${SCRATCHPAD_FILE}.backup-$(date +%s)"
@@ -1044,7 +1016,7 @@ EOF
         if [ "$SHOULD_DEEP_CLEAN" = true ]; then
           echo ""
           print_warning "Deep clean triggered: $DEEP_CLEAN_REASON"
-          print_info "Performing automated deep clean..."
+          print_status "Performing automated deep clean..."
           echo ""
 
           DEEP_CLEAN_TEMP=$(mktemp)
@@ -1148,7 +1120,7 @@ EOF
           echo "   New size: $(( $(wc -c < "$SCRATCHPAD_FILE") / 1024 ))KB"
 
           # Check HIGH PRIORITY completion status
-          print_info "Checking HIGH PRIORITY items completion status..."
+          print_status "Checking HIGH PRIORITY items completion status..."
 
           HIGH_PRIORITY=$(sed -n '/^## 🔥 HIGH PRIORITY/,/^## /p' "$SCRATCHPAD_FILE" | sed '$d')
 
@@ -1169,7 +1141,7 @@ EOF
           fi
 
           # Step 4: Clean up stale worktrees
-          print_info "Checking for stale worktrees..."
+          print_status "Checking for stale worktrees..."
 
           EXISTING_WORKTREES=$(git worktree list --porcelain | grep -E "^worktree $RITE_WORKTREE_DIR" | sed 's/^worktree //' || echo "")
 
@@ -1235,7 +1207,7 @@ EOF
 
           # Step 5: Send Slack notification summary
           if [ -n "${SLACK_WEBHOOK:-}" ]; then
-            print_info "Sending deep clean summary to Slack..."
+            print_status "Sending deep clean summary to Slack..."
 
             # Calculate totals
             SCRATCHPAD_LINES_REMOVED=$(( ORIGINAL_LINES - NEW_LINES ))
@@ -1337,7 +1309,7 @@ EOF
       fi
 
       # Clean up worktree for reuse (don't delete it)
-      print_info "Cleaning worktree for future reuse..."
+      print_status "Cleaning worktree for future reuse..."
 
       cd "$CURRENT_DIR"
       UNCOMMITTED=$(git status --porcelain 2>/dev/null || echo "")

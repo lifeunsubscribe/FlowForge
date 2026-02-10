@@ -369,50 +369,23 @@ else
 fi
 echo ""
 
-# Check 13: GitHub Actions Workflow
-print_info "Checking GitHub Actions workflow..."
+# Check 13: Review setup
+print_info "Checking review setup..."
 
+# The GitHub Actions auto-review workflow is deprecated; local reviews are used instead
 WORKFLOW_FILE="$RITE_PROJECT_ROOT/.github/workflows/claude-code-review.yml"
 INSTRUCTIONS_FILE="$RITE_PROJECT_ROOT/.github/claude-code/pr-review-instructions.md"
 
 if [ -f "$WORKFLOW_FILE" ]; then
-  print_success "Sharkrite review workflow found"
+  print_warning "Found deprecated claude-code-review.yml — can be removed (local reviews are used instead)"
+fi
 
-  # Check permissions
-  if grep -q "pull-requests: write" "$WORKFLOW_FILE"; then
-    print_success "PR write permissions configured"
-  elif grep -q "pull-requests: read" "$WORKFLOW_FILE"; then
-    print_error "PR permissions are read-only (needs 'write' for comments)"
-    print_info "Edit $WORKFLOW_FILE: change 'pull-requests: read' to 'pull-requests: write'"
-    ISSUES_FOUND=$((ISSUES_FOUND + 1))
-
-    if [ "$FIX_MODE" = true ]; then
-      sed -i '' 's/pull-requests: read/pull-requests: write/' "$WORKFLOW_FILE"
-      print_success "Fixed: Updated permissions to write"
-      ISSUES_FOUND=$((ISSUES_FOUND - 1))
-    fi
-  fi
-
-  # Check if instructions file exists
-  if [ -f "$INSTRUCTIONS_FILE" ]; then
-    print_success "Review instructions file found"
-  else
-    print_warning "Review instructions file missing"
-    print_info "Create: .github/claude-code/pr-review-instructions.md"
-    print_info "Or run: rite --init (will offer to create it)"
-  fi
-
-  # Check if workflow references the instructions
-  if grep -q "pr-review-instructions.md" "$WORKFLOW_FILE"; then
-    print_success "Workflow references instructions file"
-  else
-    print_warning "Workflow may not be using instructions file"
-    print_info "Ensure prompt includes: 'Read .github/claude-code/pr-review-instructions.md'"
-  fi
-
+if [ -f "$INSTRUCTIONS_FILE" ]; then
+  print_success "Review instructions file found"
 else
-  print_warning "No Sharkrite review workflow found"
-  print_info "Run 'rite --init' to create one"
+  print_warning "Review instructions file missing"
+  print_info "Create: .github/claude-code/pr-review-instructions.md"
+  print_info "Or run: rite --init (will offer to create it)"
 fi
 echo ""
 

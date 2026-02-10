@@ -212,6 +212,7 @@ print_success() { echo -e "${GREEN}✅ $1${NC}"; }
 print_error() { echo -e "${RED}❌ $1${NC}"; }
 print_warning() { echo -e "${YELLOW}⚠️  $1${NC}"; }
 print_info() { echo -e "${BLUE}ℹ️  $1${NC}"; }
+print_status() { echo -e "${BLUE}$1${NC}"; }
 print_step() { echo -e "${CYAN}▶  $1${NC}"; }
 
 # ===================================================================
@@ -236,7 +237,7 @@ if [ "$FIX_REVIEW_MODE" = true ]; then
 
   # Fetch latest assessment from PR comment (single source of truth)
   if [ -n "$FIX_PR_NUMBER" ]; then
-    print_info "Fetching latest assessment from PR #$FIX_PR_NUMBER..."
+    print_status "Fetching latest assessment from PR #$FIX_PR_NUMBER..."
     REVIEW_CONTENT=$(gh pr view "$FIX_PR_NUMBER" --json comments \
       --jq '[.comments[] | select(.body | contains("<!-- sharkrite-assessment"))] | sort_by(.createdAt) | reverse | .[0].body' \
       2>/dev/null || echo "")
@@ -247,7 +248,7 @@ if [ "$FIX_REVIEW_MODE" = true ]; then
       REVIEW_CONTENT=$(echo "$REVIEW_CONTENT" | sed -n '/^---$/,$p' | tail -n +2)
     fi
   else
-    print_info "No PR number provided, reading review content from stdin..."
+    print_status "No PR number provided, reading review content from stdin..."
     REVIEW_CONTENT=$(cat)
   fi
 
@@ -330,7 +331,7 @@ The workflow will automatically commit, push, and request a new review.
 
 $EXIT_INSTRUCTION"
 
-  print_info "Invoking Sharkrite to fix review issues..."
+  print_status "Invoking Sharkrite to fix review issues..."
   echo ""
 
   # Run Claude Code with the fix prompt
@@ -348,9 +349,16 @@ $EXIT_INSTRUCTION"
   echo "$FIX_PROMPT" > "$FIX_PROMPT_FILE"
 
   if [ "$AUTO_MODE" = true ]; then
-    print_info "Auto mode: Claude will exit automatically when fixes complete (timeout: ${FIX_TIMEOUT}s)"
+    print_status "Auto mode: Claude will exit automatically when fixes complete (timeout: ${FIX_TIMEOUT}s)"
     set +e  # Temporarily disable exit-on-error to capture timeout
-    timeout "$FIX_TIMEOUT" $CLAUDE_CMD --print --dangerously-skip-permissions --disallowedTools "$DISALLOWED_TOOLS" < "$FIX_PROMPT_FILE"
+    # Detect timeout command (gtimeout on macOS via coreutils, timeout on Linux)
+    if command -v gtimeout >/dev/null 2>&1; then
+      gtimeout "$FIX_TIMEOUT" $CLAUDE_CMD --print --dangerously-skip-permissions --disallowedTools "$DISALLOWED_TOOLS" < "$FIX_PROMPT_FILE"
+    elif command -v timeout >/dev/null 2>&1; then
+      timeout "$FIX_TIMEOUT" $CLAUDE_CMD --print --dangerously-skip-permissions --disallowedTools "$DISALLOWED_TOOLS" < "$FIX_PROMPT_FILE"
+    else
+      $CLAUDE_CMD --print --dangerously-skip-permissions --disallowedTools "$DISALLOWED_TOOLS" < "$FIX_PROMPT_FILE"
+    fi
     FIX_EXIT_CODE=$?
     set -e
 
@@ -373,8 +381,8 @@ $EXIT_INSTRUCTION"
     # Pass prompt as command-line argument (not stdin) to preserve TTY for interactivity.
     SUPERVISED_TIMEOUT=${RITE_SUPERVISED_TIMEOUT:-3600}  # Default 1 hour
     print_info "Supervised mode: Interactive fix session (timeout: ${SUPERVISED_TIMEOUT}s)"
-    print_info "Tool restrictions active: gh, curl, wget blocked"
-    print_info "Exit the session when fixes are complete."
+    print_status "Tool restrictions active: gh, curl, wget blocked"
+    print_status "Exit the session when fixes are complete."
 
     rm -f "$FIX_PROMPT_FILE"
 
@@ -399,7 +407,7 @@ $EXIT_INSTRUCTION"
   print_success "Review fix session complete"
 
   # Commit and push the fixes
-  print_info "Committing fixes..."
+  print_status "Committing fixes..."
   git add -A
 
   # Generate commit message based on review content summary
@@ -426,7 +434,7 @@ Changes made via automated workflow (rite --fix-review mode)."
     # The new review will see current state and assess fresh
   }
 
-  print_info "Pushing fixes to remote..."
+  print_status "Pushing fixes to remote..."
   git push
 
   print_success "Fixes committed and pushed successfully"
@@ -549,10 +557,10 @@ if [ -n "$TASK_IDENTIFIER" ]; then
     TARGET_BRANCH=$(echo "$WORKTREE_INFO" | cut -d'|' -f2)
 
     print_success "Found existing worktree for issue #$ISSUE_NUMBER"
-    print_info "Branch: $TARGET_BRANCH"
-    print_info "Location: $TARGET_WORKTREE"
+    print_status "Branch: $TARGET_BRANCH"
+    print_status "Location: $TARGET_WORKTREE"
     echo ""
-    print_info "Navigating to worktree..."
+    print_status "Navigating to worktree..."
 
     # Re-execute script in target worktree, passing issue description to avoid losing it
     # Use cd in subshell and export vars separately to avoid command injection
@@ -631,7 +639,7 @@ if [ -z "$ISSUE_NUMBER" ]; then
     else
       # PR exists but only has placeholder commit - need to run development
       print_info "PR #$PR_NUMBER exists but has no implementation yet"
-      print_info "Running development phase..."
+      print_status "Running development phase..."
       echo ""
     fi
   else
@@ -694,7 +702,7 @@ else
       UNCOMMITTED_FILES=$(git -C "$EXISTING_WT_FOR_BRANCH" status --short 2>/dev/null || echo "")
 
       # Use Claude CLI to analyze if changes are relevant to the issue
-      print_info "Analyzing if changes are relevant to issue #$ISSUE_NUMBER..."
+      print_status "Analyzing if changes are relevant to issue #$ISSUE_NUMBER..."
 
       ANALYSIS_PROMPT="Issue #$ISSUE_NUMBER: $ISSUE_DESC
 
@@ -729,14 +737,14 @@ If the changes are unrelated work, answer UNRELATED."
         fi
       elif [ "$RELEVANCE" = "UNRELATED" ]; then
         # Changes are unrelated - stash them
-        print_info "Changes are unrelated to issue #$ISSUE_NUMBER - stashing..."
+        print_status "Changes are unrelated to issue #$ISSUE_NUMBER - stashing..."
 
         cd "$EXISTING_WT_FOR_BRANCH" || exit 1
         STASH_MSG="Auto-stash unrelated changes before issue #$ISSUE_NUMBER ($(date +%Y-%m-%d))"
 
         if git stash push -m "$STASH_MSG" 2>/dev/null; then
           print_success "Changes stashed: $STASH_MSG"
-          print_info "Recover later with: git stash list"
+          print_status "Recover later with: git stash list"
           cd - > /dev/null || exit 1
         else
           print_error "Failed to stash changes"
@@ -747,7 +755,7 @@ If the changes are unrelated work, answer UNRELATED."
       else
         # Unknown - fail safe and ask user
         print_warning "Could not determine if changes are relevant"
-        print_info "Uncommitted files:"
+        print_status "Uncommitted files:"
         echo "$UNCOMMITTED_FILES"
         echo ""
         print_error "Please commit or stash changes manually in: $EXISTING_WT_FOR_BRANCH"
@@ -755,7 +763,7 @@ If the changes are unrelated work, answer UNRELATED."
       fi
     fi
 
-    print_info "Navigating to existing worktree..."
+    print_status "Navigating to existing worktree..."
     # Pass issue info via environment to avoid losing it
     # Use cd and export separately to avoid command injection
     cd "$EXISTING_WT_FOR_BRANCH" || exit 1
@@ -834,7 +842,7 @@ If the changes are unrelated work, answer UNRELATED."
       # Check if at limit
       if [ "$WORKTREE_COUNT" -ge "$MAX_WORKTREES" ]; then
         print_warning "At worktree limit ($WORKTREE_COUNT/$MAX_WORKTREES)"
-        print_info "Auto-cleanup: Looking for reusable worktrees..."
+        print_status "Auto-cleanup: Looking for reusable worktrees..."
 
         # Find worktrees with:
         # 1. No uncommitted changes
@@ -854,7 +862,7 @@ If the changes are unrelated work, answer UNRELATED."
 
           # Check if branch is merged (not on remote anymore)
           if ! git ls-remote --heads origin "$WT_BRANCH" | grep -q "$WT_BRANCH" 2>/dev/null; then
-            print_info "Cleaning merged worktree: $WT_BRANCH"
+            print_status "Cleaning merged worktree: $WT_BRANCH"
             git worktree remove "$wt_path" 2>/dev/null || true
             git branch -d "$WT_BRANCH" 2>/dev/null || true
             CLEANED_COUNT=$((CLEANED_COUNT + 1))
@@ -867,7 +875,7 @@ If the changes are unrelated work, answer UNRELATED."
           WORKTREE_COUNT=$((WORKTREE_COUNT - CLEANED_COUNT))
         else
           # No clean worktrees found - look for oldest stale one
-          print_info "No merged branches found - checking for stale worktrees..."
+          print_status "No merged branches found - checking for stale worktrees..."
 
           OLDEST_WORKTREE=""
           OLDEST_AGE=0
@@ -895,7 +903,7 @@ If the changes are unrelated work, answer UNRELATED."
 
           if [ -n "$OLDEST_WORKTREE" ] && [ "$OLDEST_AGE" -gt 86400 ]; then  # > 1 day old
             DAYS_OLD=$((OLDEST_AGE / 86400))
-            print_info "Removing stale worktree: $OLDEST_BRANCH (${DAYS_OLD} days old, no uncommitted changes)"
+            print_status "Removing stale worktree: $OLDEST_BRANCH (${DAYS_OLD} days old, no uncommitted changes)"
             git worktree remove "$OLDEST_WORKTREE" 2>/dev/null || true
             git branch -d "$OLDEST_BRANCH" 2>/dev/null || true
             print_success "Removed stale worktree - will create new one for issue #$ISSUE_NUMBER"
@@ -903,7 +911,7 @@ If the changes are unrelated work, answer UNRELATED."
             # Has worktrees but all are recent (< 1 day) - still remove oldest if no uncommitted changes
             HOURS_OLD=$((OLDEST_AGE / 3600))
             print_warning "All worktrees are recent (oldest: ${HOURS_OLD}h)"
-            print_info "Removing oldest clean worktree: $OLDEST_BRANCH"
+            print_status "Removing oldest clean worktree: $OLDEST_BRANCH"
             git worktree remove "$OLDEST_WORKTREE" 2>/dev/null || true
             git branch -d "$OLDEST_BRANCH" 2>/dev/null || true
             print_success "Removed worktree - will create new one for issue #$ISSUE_NUMBER"
@@ -924,7 +932,7 @@ If the changes are unrelated work, answer UNRELATED."
     fi
 
     echo ""
-    print_info "Creating worktree at: $WORKTREE_PATH"
+    print_status "Creating worktree at: $WORKTREE_PATH"
 
     # Check if branch already exists
     if git show-ref --verify --quiet refs/heads/"$BRANCH_NAME"; then
@@ -999,14 +1007,14 @@ If the changes are unrelated work, answer UNRELATED."
 
     # Symlink node_modules to save disk space (if project has them)
     if [ -d "$MAIN_WORKTREE/node_modules" ]; then
-      print_info "Symlinking node_modules from main worktree..."
+      print_status "Symlinking node_modules from main worktree..."
       cd "$WORKTREE_PATH"
       rm -rf node_modules 2>/dev/null || true
       ln -s "$MAIN_WORKTREE/node_modules" node_modules
       cd "$WORKTREE_PATH"
       print_success "node_modules symlinked"
     elif [ -d "$MAIN_WORKTREE/backend/node_modules" ]; then
-      print_info "Symlinking backend/node_modules from main worktree..."
+      print_status "Symlinking backend/node_modules from main worktree..."
       cd "$WORKTREE_PATH/backend" 2>/dev/null || true
       rm -rf node_modules 2>/dev/null || true
       ln -s "$MAIN_WORKTREE/backend/node_modules" node_modules 2>/dev/null || true
@@ -1017,7 +1025,7 @@ If the changes are unrelated work, answer UNRELATED."
     # Symlink rite data dir to share scratchpad and context across worktrees
     RITE_DATA_PATH="$MAIN_WORKTREE/$RITE_DATA_DIR"
     if [ -d "$RITE_DATA_PATH" ]; then
-      print_info "Symlinking $RITE_DATA_DIR directory for shared scratchpad..."
+      print_status "Symlinking $RITE_DATA_DIR directory for shared scratchpad..."
       rm -rf "$WORKTREE_PATH/$RITE_DATA_DIR" 2>/dev/null || true
       ln -s "$RITE_DATA_PATH" "$WORKTREE_PATH/$RITE_DATA_DIR"
       print_success "Shared scratchpad linked"
@@ -1041,7 +1049,7 @@ If the changes are unrelated work, answer UNRELATED."
 
     if [ -n "$LATEST_STASH_BRANCH" ] && [ "$LATEST_STASH_BRANCH" = "$BRANCH_NAME" ]; then
       # Most recent stash is from this branch - auto-apply
-      print_info "Found recent stash from this branch - auto-applying..."
+      print_status "Found recent stash from this branch - auto-applying..."
       if git stash pop 2>/dev/null; then
         print_success "Stash applied"
       else
@@ -1137,7 +1145,7 @@ This PR is being worked on. Implementation details will be updated as work progr
 ---
 _Draft PR created automatically by rite for tracking purposes._"
 
-  print_info "Creating draft PR..."
+  print_status "Creating draft PR..."
 
   gh pr create \
     --draft \
@@ -1179,7 +1187,7 @@ SECURITY_CONTEXT=""
 # SCRATCHPAD_FILE set by config.sh
 
 if [ -f "$SCRATCHPAD_FILE" ]; then
-  print_info "Loading recent security findings from scratchpad..."
+  print_status "Loading recent security findings from scratchpad..."
 
   # Extract "Recent Security Findings" section
   SECURITY_CONTEXT=$(sed -n '/## Recent Security Findings/,/## /p' "$SCRATCHPAD_FILE" | sed '1d;$d' || echo "")
@@ -1360,7 +1368,7 @@ elif [ "$ALREADY_IN_CLAUDE" = true ]; then
 else
   # Set timeout for Claude Code (configurable via RITE_CLAUDE_TIMEOUT, default 2 hours)
   CLAUDE_TIMEOUT=${RITE_CLAUDE_TIMEOUT:-7200}
-  print_info "Launching Sharkrite (timeout: ${CLAUDE_TIMEOUT}s)..."
+  print_status "Launching Sharkrite (timeout: ${CLAUDE_TIMEOUT}s)..."
 
   # Detect timeout command (gtimeout on macOS via coreutils, timeout on Linux)
   if command -v gtimeout >/dev/null 2>&1; then
@@ -1403,8 +1411,6 @@ else
               if .type == "text" then "\u001b[38;5;216m" + .text + "\u001b[0m"
               elif .type == "tool_use" then "\n\u001b[0;33m⚡ " + .name + "\u001b[0m\n"
               else empty end)
-          elif .type == "result" then
-            .result // empty
           else empty end
         ' 2>/dev/null || true
       CLAUDE_EXIT_CODE=${PIPESTATUS[0]}
@@ -1418,8 +1424,6 @@ else
               if .type == "text" then "\u001b[38;5;216m" + .text + "\u001b[0m"
               elif .type == "tool_use" then "\n\u001b[0;33m⚡ " + .name + "\u001b[0m\n"
               else empty end)
-          elif .type == "result" then
-            .result // empty
           else empty end
         ' 2>/dev/null || true
       CLAUDE_EXIT_CODE=${PIPESTATUS[0]}
@@ -1437,7 +1441,7 @@ else
   if [ $CLAUDE_EXIT_CODE -eq 124 ]; then
     # Timeout
     print_error "Sharkrite timed out after ${CLAUDE_TIMEOUT}s"
-    print_info "Checking for uncommitted work..."
+    print_status "Checking for uncommitted work..."
 
     if [ "$(git status --porcelain | { grep -v "\.gitignore$" || true; } | wc -l | tr -d ' ')" -gt 0 ]; then
       print_warning "Found uncommitted changes - committing before exit"
@@ -1455,7 +1459,7 @@ else
     exit 127
   elif [ $CLAUDE_EXIT_CODE -ne 0 ]; then
     print_error "Sharkrite exited with error code $CLAUDE_EXIT_CODE"
-    print_info "Checking for uncommitted work..."
+    print_status "Checking for uncommitted work..."
 
     if [ "$(git status --porcelain | { grep -v "\.gitignore$" || true; } | wc -l | tr -d ' ')" -gt 0 ]; then
       print_warning "Found uncommitted changes - will attempt to save work"
@@ -1538,7 +1542,7 @@ if [ $CHANGES_COUNT -eq 0 ]; then
     if [ -n "$CURRENT_BRANCH" ] && [ "$CURRENT_BRANCH" != "main" ]; then
       # Check if this is an empty branch we just created
       if git log --oneline origin/main..HEAD 2>/dev/null | grep -q "chore: initialize work"; then
-        print_info "Cleaning up empty branch..."
+        print_status "Cleaning up empty branch..."
 
         # Delete the draft PR if it exists
         DRAFT_PR=$(gh pr list --head "$CURRENT_BRANCH" --json number --jq '.[0].number' 2>/dev/null || echo "")
@@ -1576,7 +1580,7 @@ else
 fi
 
 if [[ $RUN_TESTS =~ ^[Yy]$ ]]; then
-  print_info "Running tests..."
+  print_status "Running tests..."
 
   if [ -f "package.json" ]; then
     if npm test 2>&1; then
@@ -1634,7 +1638,7 @@ fi
 
 # Smart commit message generation
 if [ "$AUTO_MODE" = false ]; then
-  print_info "Generating commit message..."
+  print_status "Generating commit message..."
 fi
 
 # Extract commit type from branch name
@@ -1643,11 +1647,29 @@ if [[ "$BRANCH_NAME" =~ ^(fix|feat|docs|test|refactor|chore)/ ]]; then
   COMMIT_TYPE=$(echo "$BRANCH_NAME" | cut -d'/' -f1)
 fi
 
-# Generate commit subject from branch name
-COMMIT_SUBJECT=$(echo "$BRANCH_NAME" | sed 's/.*\///' | tr '-' ' ')
+# Build commit message from issue description (not branch name, which is truncated/mangled).
+# ISSUE_DESC is the GitHub issue title, e.g., "fix: password regex missing anchor - allows technical 4-char match"
+# If it already has a conventional commit prefix, use it as-is; otherwise prepend the type.
+if echo "$ISSUE_DESC" | grep -qE "^(fix|feat|docs|test|refactor|chore|build|ci|perf|style)(\(.*\))?:"; then
+  COMMIT_SUBJECT="$ISSUE_DESC"
+else
+  COMMIT_SUBJECT="${COMMIT_TYPE}: ${ISSUE_DESC}"
+fi
 
-# Conventional commit message
-COMMIT_MSG="${COMMIT_TYPE}: ${COMMIT_SUBJECT}"
+# Add body with changed files summary (before staging, so use working tree diff)
+CHANGED_FILES=$(git status --porcelain | grep -vE "^\?\?" | grep -v "\.gitignore$" | sed 's/^...//' | sort 2>/dev/null || true)
+COMMIT_BODY=""
+if [ -n "$CHANGED_FILES" ]; then
+  FILE_COUNT=$(echo "$CHANGED_FILES" | wc -l | tr -d ' ')
+  COMMIT_BODY="
+
+Files changed (${FILE_COUNT}):
+$(echo "$CHANGED_FILES" | sed 's/^/  - /')
+
+${ISSUE_NUMBER:+Closes #$ISSUE_NUMBER}"
+fi
+
+COMMIT_MSG="${COMMIT_SUBJECT}${COMMIT_BODY}"
 
 if [ "$AUTO_MODE" = false ]; then
   echo ""
@@ -1705,7 +1727,7 @@ git reset HEAD .gitignore 2>/dev/null || true
 git commit -m "$COMMIT_MSG" > /dev/null
 
 if [ "$AUTO_MODE" = true ]; then
-  echo "✅ Committed: $COMMIT_MSG"
+  echo "✅ Committed: $COMMIT_SUBJECT"
 else
   print_success "Commit created"
   echo ""

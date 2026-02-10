@@ -14,8 +14,7 @@ update_scratchpad_from_pr() {
   local pr_title="${2:-PR #$pr_number}"
 
   if [ ! -f "$SCRATCHPAD_FILE" ]; then
-    echo "Scratchpad not found: $SCRATCHPAD_FILE" >&2
-    return 1
+    return 0
   fi
 
   echo "Updating scratchpad with PR #$pr_number findings..."

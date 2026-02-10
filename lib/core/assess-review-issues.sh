@@ -119,14 +119,32 @@ fi
 
 # Override print functions to send to stderr (don't interfere with stdout pipe)
 print_info() { echo -e "${BLUE}ℹ️  $1${NC}" >&2; }
+print_status() { echo -e "${BLUE}$1${NC}" >&2; }
 print_success() { echo -e "${GREEN}✅ $1${NC}" >&2; }
 print_warning() { echo -e "${YELLOW}⚠️  $1${NC}" >&2; }
 print_error() { echo -e "${RED}❌ $1${NC}" >&2; }
 
-print_info "Assessing review issues with Claude..."
+print_status "Assessing review issues with Claude..."
 
 # Read full review content
 REVIEW_CONTENT=$(cat "$REVIEW_FILE")
+
+# =============================================================================
+# EARLY EXIT: Skip assessment entirely if review has zero findings
+# =============================================================================
+# The assessment's job is to categorize REVIEW findings into NOW/LATER/DISMISSED.
+# When the review itself reports zero findings, there's nothing to categorize.
+# Without this check, the assessment Claude reads positive prose and invents issues.
+
+FINDINGS_LINE=$(echo "$REVIEW_CONTENT" | grep -oE "Findings: CRITICAL: [0-9]+ [|] HIGH: [0-9]+ [|] MEDIUM: [0-9]+ [|] LOW: [0-9]+" | head -1 || true)
+if [ -n "$FINDINGS_LINE" ]; then
+  TOTAL_FINDINGS=$(echo "$FINDINGS_LINE" | grep -oE "[0-9]+" | awk '{sum += $1} END {print sum}')
+  if [ "${TOTAL_FINDINGS:-0}" -eq 0 ]; then
+    print_success "Review has zero findings — nothing to assess" >&2
+    echo "NO_ACTIONABLE_ITEMS"
+    exit 0
+  fi
+fi
 
 # Get original issue context for scope assessment
 ISSUE_CONTEXT=$(gh pr view "$PR_NUMBER" --json body --jq '.body' 2>/dev/null | grep -oE 'Closes #[0-9]+|Fixes #[0-9]+|Resolves #[0-9]+' | head -1 | grep -oE '[0-9]+' || echo "")
@@ -149,7 +167,7 @@ ASSESSMENT_CONTEXT=""
 if [ -f "$RITE_PROJECT_ROOT/$RITE_DATA_DIR/assessment-prompt.md" ]; then
   # Project has a custom assessment prompt — use it
   ASSESSMENT_CONTEXT=$(cat "$RITE_PROJECT_ROOT/$RITE_DATA_DIR/assessment-prompt.md")
-  print_info "Using project-specific assessment context (.rite/assessment-prompt.md)" >&2
+  print_status "Using project-specific assessment context (.rite/assessment-prompt.md)"
 elif [ -f "$RITE_PROJECT_ROOT/CLAUDE.md" ]; then
   # Extract relevant sections from project's CLAUDE.md
   # Look for security, architecture, and standards sections
@@ -164,16 +182,16 @@ ${CONVENTIONS}"
   fi
 
   if [ -n "$ASSESSMENT_CONTEXT" ]; then
-    print_info "Using assessment context extracted from CLAUDE.md" >&2
+    print_status "Using assessment context extracted from CLAUDE.md"
   else
     # CLAUDE.md exists but no relevant sections found — use generic
     ASSESSMENT_CONTEXT=$(cat "$RITE_INSTALL_DIR/templates/assessment-prompt.md" 2>/dev/null || echo "")
-    print_info "Using generic assessment context (CLAUDE.md had no relevant sections)" >&2
+    print_status "Using generic assessment context (CLAUDE.md had no relevant sections)"
   fi
 else
   # No project-specific context — use generic template
   ASSESSMENT_CONTEXT=$(cat "$RITE_INSTALL_DIR/templates/assessment-prompt.md" 2>/dev/null || echo "")
-  print_info "Using generic assessment context (no CLAUDE.md found)" >&2
+  print_status "Using generic assessment context (no CLAUDE.md found)"
 fi
 
 # Build project context section for the prompt
@@ -381,7 +399,7 @@ if FRESH_ASSESSMENT=$(check_assessment_freshness "$PR_NUMBER" 2>/dev/null); then
   exit 0
 fi
 
-print_info "Running Claude assessment (this may take 30-60 seconds)..."
+print_status "Running Claude assessment (this may take 30-60 seconds)..."
 
 # Run Claude assessment - mode depends on supervised vs unsupervised
 if [ "$AUTO_MODE" = true ]; then
@@ -472,8 +490,8 @@ if [ "$AUTO_MODE" = true ]; then
   fi
 else
   # SUPERVISED MODE: Interactive Claude session with permission prompts
-  print_info "Starting interactive Claude session..."
-  print_info "You can review and approve Claude's assessment decisions"
+  print_status "Starting interactive Claude session..."
+  print_status "You can review and approve Claude's assessment decisions"
   echo ""
 
   # Build Claude args with model flag for consistency
@@ -594,7 +612,7 @@ ASSESSMENT_COMMENT="<!-- sharkrite-assessment pr:${PR_NUMBER} iteration:1 timest
 ${ASSESSMENT_OUTPUT}"
 
 # Post assessment as PR comment
-print_info "Posting assessment to PR #$PR_NUMBER..."
+print_status "Posting assessment to PR #$PR_NUMBER..."
 if gh pr comment "$PR_NUMBER" --body "$ASSESSMENT_COMMENT" >/dev/null 2>&1; then
   print_success "Assessment posted to PR"
 else
@@ -606,7 +624,7 @@ fi
 # =============================================================================
 
 if [ "$ACTIONABLE_LATER_COUNT" -gt 0 ]; then
-  print_info "Processing $ACTIONABLE_LATER_COUNT ACTIONABLE_LATER items..."
+  print_status "Processing $ACTIONABLE_LATER_COUNT ACTIONABLE_LATER items..."
 
   # Get existing open tech-debt issues to check for duplicates
   EXISTING_ISSUES=$(gh issue list --state open --label "tech-debt" --json number,title --jq '.[] | "\(.number):\(.title)"' 2>/dev/null || echo "")
@@ -742,7 +760,7 @@ _Parent PR: #${PR_NUMBER}_"
   # pipeline is refactored to avoid the subshell (e.g., process substitution).
   # For now, issue creation still works — the PR body just doesn't get updated.
   if [ -n "$CREATED_ISSUES" ] || [ -n "$UPDATED_ISSUES" ]; then
-    print_info "Updating PR body with follow-up issue links..."
+    print_status "Updating PR body with follow-up issue links..."
 
     CURRENT_BODY=$(gh pr view "$PR_NUMBER" --json body --jq '.body' 2>/dev/null)
 

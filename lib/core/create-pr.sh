@@ -20,6 +20,9 @@ source "$RITE_LIB_DIR/utils/blocker-rules.sh"
 # Source review helper for consistent review method handling
 source "$RITE_LIB_DIR/utils/review-helper.sh"
 
+# Source PR summary helpers for changes-summary section in PR body
+source "$RITE_LIB_DIR/utils/pr-summary.sh"
+
 # Parse arguments
 AUTO_MODE=false
 ISSUE_NUMBER=""
@@ -63,6 +66,7 @@ print_success() { echo -e "${GREEN}✅ $1${NC}"; }
 print_error() { echo -e "${RED}❌ $1${NC}"; }
 print_warning() { echo -e "${YELLOW}⚠️  $1${NC}"; }
 print_info() { echo -e "${BLUE}ℹ️  $1${NC}"; }
+print_status() { echo -e "${BLUE}$1${NC}"; }
 
 # Check dependencies
 if ! command -v gh &> /dev/null; then
@@ -78,7 +82,7 @@ fi
 # Smart navigation: if on main/develop and issue number provided, find worktree
 if [[ "$CURRENT_BRANCH" == "main" || "$CURRENT_BRANCH" == "develop" ]]; then
   if [ ! -z "$ISSUE_NUMBER" ]; then
-    print_info "On $CURRENT_BRANCH branch - looking for worktree for issue #$ISSUE_NUMBER..."
+    print_status "On $CURRENT_BRANCH branch - looking for worktree for issue #$ISSUE_NUMBER..."
 
     # Find worktree with this issue number
     TARGET_WORKTREE=$(git worktree list --porcelain | grep -E "^worktree $RITE_WORKTREE_DIR" | sed 's/^worktree //' | while read -r wt_path; do
@@ -104,8 +108,8 @@ if [[ "$CURRENT_BRANCH" == "main" || "$CURRENT_BRANCH" == "develop" ]]; then
   else
     print_error "Cannot create PR from $CURRENT_BRANCH branch"
     print_info "Either:"
-    print_info "  1. Switch to feature branch: git checkout BRANCH_NAME"
-    print_info "  2. Provide issue number: $0 ISSUE_NUMBER"
+    print_status "  1. Switch to feature branch: git checkout BRANCH_NAME"
+    print_status "  2. Provide issue number: $0 ISSUE_NUMBER"
     exit 1
   fi
 fi
@@ -141,7 +145,7 @@ if [ ! -z "$EXISTING_PR" ] && [ "$EXISTING_PR" != "null" ]; then
 
   # If PR is draft, mark it as ready for review (work is complete)
   if [ "$IS_DRAFT" = "true" ]; then
-    print_info "PR is draft - marking as ready for review..."
+    print_status "PR is draft - marking as ready for review..."
     gh pr ready "$PR_NUMBER" 2>/dev/null || print_warning "Could not mark PR as ready"
     print_success "PR marked as ready for review"
     echo ""
@@ -153,39 +157,35 @@ if [ ! -z "$EXISTING_PR" ] && [ "$EXISTING_PR" != "null" ]; then
 
   if [ "$CURRENT_HEAD" != "$PR_HEAD" ]; then
     # Push new commits to PR first
-    print_info "Pushing new commits to PR..."
+    print_status "Pushing new commits to PR..."
     if ! git push origin "$CURRENT_BRANCH"; then
       print_error "Failed to push commits to remote"
       print_info "Your branch may be behind the remote. Try: git pull --rebase origin $CURRENT_BRANCH"
       exit 1
     fi
 
-    # Update PR description with latest changes (preserve issue link for undo discovery + GitHub auto-close)
-    print_info "Updating PR description..."
+    # Update changes summary in PR description (preserves issue link, checklists, etc.)
+    print_status "Updating PR description..."
     EXISTING_BODY=$(gh pr view "$PR_NUMBER" --json body --jq '.body' 2>/dev/null || echo "")
-    ISSUE_LINK=$(echo "$EXISTING_BODY" | grep -oE '(Closes|closes|Fixes|fixes|Resolves|resolves) #[0-9]+' | head -1)
+    FRESH_SUMMARY=$(build_changes_summary "$BASE_BRANCH")
 
-    UPDATED_BODY="## Summary
+    if [ -n "$EXISTING_BODY" ]; then
+      UPDATED_BODY=$(replace_changes_summary "$EXISTING_BODY" "$FRESH_SUMMARY")
+    else
+      # No existing body (shouldn't happen) — build a minimal one
+      ISSUE_LINK=$(echo "$EXISTING_BODY" | grep -oE '(Closes|closes|Fixes|fixes|Resolves|resolves) #[0-9]+' | head -1)
+      UPDATED_BODY="## Summary
 
 ${ISSUE_LINK:+$ISSUE_LINK}
 
-## Recent Changes
-
-$(git log --oneline origin/$BASE_BRANCH..HEAD 2>/dev/null | head -10)
-
-## Latest Commit
-
-$(git log -1 --pretty=format:%B)
-
----
-
-_Updated: $(date +%Y-%m-%d\ %H:%M:%S)_"
+${FRESH_SUMMARY}"
+    fi
 
     gh pr edit "$PR_NUMBER" --body "$UPDATED_BODY" 2>/dev/null || print_warning "Could not update PR description"
     print_success "PR updated with new commits"
     echo ""
   else
-    print_info "No new commits since last push"
+    print_success "PR #$PR_NUMBER branch is up to date — all commits already pushed"
     echo ""
   fi
 fi
@@ -198,7 +198,7 @@ if [ "$PR_EXISTS" = false ]; then
 
   # If issue number provided, fetch issue details
   if [ ! -z "$ISSUE_NUMBER" ]; then
-    print_info "Fetching issue #$ISSUE_NUMBER details..."
+    print_status "Fetching issue #$ISSUE_NUMBER details..."
 
     ISSUE_JSON=$(gh issue view $ISSUE_NUMBER --json title,body,labels 2>/dev/null || echo "")
 
@@ -219,15 +219,8 @@ if [ "$PR_EXISTS" = false ]; then
     PR_TITLE=$(echo "$CURRENT_BRANCH" | sed 's/.*\///' | tr '-' ' ' | sed 's/\b\(.\)/\u\1/g')
   fi
 
-  # Get commit summary
-  COMMIT_SUMMARY=$(git log --oneline origin/$BASE_BRANCH..HEAD 2>/dev/null || git log --oneline HEAD~5..HEAD)
-  COMMIT_COUNT=$(echo "$COMMIT_SUMMARY" | wc -l | tr -d ' ')
-
-  # Get file changes summary
-  FILES_CHANGED=$(git diff --name-status origin/$BASE_BRANCH..HEAD 2>/dev/null || git diff --name-status HEAD~1..HEAD)
-  FILES_ADDED=$(echo "$FILES_CHANGED" | grep -c '^A' || true)
-  FILES_MODIFIED=$(echo "$FILES_CHANGED" | grep -c '^M' || true)
-  FILES_DELETED=$(echo "$FILES_CHANGED" | grep -c '^D' || true)
+  # Build changes summary (marked section)
+  CHANGES_SUMMARY=$(build_changes_summary "$BASE_BRANCH")
 
   # Build PR body
   PR_BODY=$(cat <<EOF
@@ -237,13 +230,7 @@ $(if [ ! -z "$ISSUE_NUMBER" ]; then echo "Closes #${ISSUE_NUMBER}"; fi)
 
 ${ISSUE_TITLE:-"Changes to ${CURRENT_BRANCH}"}
 
-## Changes Made
-
-**Commits:** $COMMIT_COUNT
-**Files Changed:** +$FILES_ADDED ~$FILES_MODIFIED -$FILES_DELETED
-
-### Commit History
-$(echo "$COMMIT_SUMMARY" | sed 's/^/- /')
+${CHANGES_SUMMARY}
 
 ## Testing
 
@@ -399,17 +386,12 @@ echo ""
 
 # Determine review method based on config (app, local, or auto)
 # This respects RITE_REVIEW_METHOD from config.sh
-print_header "🔍 Review Method Selection"
-
 REVIEW_METHOD="${RITE_REVIEW_METHOD:-auto}"
 
 if ! should_wait_for_app_review; then
   # Config says use local, or auto mode with no app detected
   if [ "$REVIEW_METHOD" = "local" ]; then
-    print_info "Review method: Local Sharkrite"
-    print_info "   Reason: RITE_REVIEW_METHOD=local (config preference)"
-    print_info "Triggering local review immediately..."
-    echo ""
+    export RITE_REVIEW_REASON="RITE_REVIEW_METHOD=local (config preference)"
 
     if [ "$AUTO_MODE" = true ]; then
       trigger_local_review "$PR_NUMBER" --auto || {
@@ -428,10 +410,7 @@ if ! should_wait_for_app_review; then
     exit 0
   else
     # Auto mode, no app detected - this is fallback
-    print_warning "Review method: Local Sharkrite (fallback)"
-    print_info "   Reason: RITE_REVIEW_METHOD=auto (fallback: no GitHub app detected)"
-    print_info "Triggering local review..."
-    echo ""
+    export RITE_REVIEW_REASON="RITE_REVIEW_METHOD=auto (fallback: no GitHub app detected)"
 
     if [ "$AUTO_MODE" = true ]; then
       trigger_local_review "$PR_NUMBER" --auto || {
@@ -452,12 +431,13 @@ if ! should_wait_for_app_review; then
 fi
 
 # If we get here, we're waiting for the GitHub app review
+print_header "🔍 Review Method Selection"
 if [ "$REVIEW_METHOD" = "app" ]; then
   print_info "Review method: GitHub App"
-  print_info "   Reason: RITE_REVIEW_METHOD=app (config preference)"
+  print_status "   Reason: RITE_REVIEW_METHOD=app (config preference)"
 else
   print_info "Review method: GitHub App"
-  print_info "   Reason: RITE_REVIEW_METHOD=auto (default: app detected)"
+  print_status "   Reason: RITE_REVIEW_METHOD=auto (default: app detected)"
 fi
 echo ""
 
@@ -486,8 +466,8 @@ LINE_WAIT=$((LINES_CHANGED / 10))
 
 INITIAL_WAIT=$((BASE_WAIT + FILE_WAIT + LINE_WAIT))
 
-print_info "Dynamic wait time: ${INITIAL_WAIT}s (base: ${BASE_WAIT}s + files: ${FILE_WAIT}s + complexity: ${LINE_WAIT}s)"
-print_info "PR size: $FILES_COUNT files, ~$LINES_CHANGED lines changed"
+print_status "Dynamic wait time: ${INITIAL_WAIT}s (base: ${BASE_WAIT}s + files: ${FILE_WAIT}s + complexity: ${LINE_WAIT}s)"
+print_status "PR size: $FILES_COUNT files, ~$LINES_CHANGED lines changed"
 echo ""
 
 # Initialize PR_READY flag
@@ -516,7 +496,7 @@ fi
 
 # Only wait if no review exists yet
 if [ "$PR_READY" != true ]; then
-  print_info "Waiting for Sharkrite review comment on PR #$PR_NUMBER..."
+  print_status "Waiting for Sharkrite review comment on PR #$PR_NUMBER..."
   echo "  Checking for comments from: claude, claude-code, github-actions[bot]"
   echo "  Looking for: comment posted AFTER latest commit"
   echo ""
@@ -583,7 +563,7 @@ while [ "$PR_READY" != true ] && [ $ELAPSED -lt $MAX_TOTAL_WAIT ]; do
         # Smart assessment: Check if old review issues are already resolved
         ASSESS_SCRIPT="$RITE_LIB_DIR/core/assess-review-issues.sh"
         if [ -f "$ASSESS_SCRIPT" ]; then
-          print_info "Assessing old review to check if issues are resolved..."
+          print_status "Assessing old review to check if issues are resolved..."
 
           # Use process substitution (no temp files) to pass review content
           ASSESSMENT_RESULT=$("$ASSESS_SCRIPT" "$PR_NUMBER" <(echo "$LATEST_REVIEW") 2>/dev/null || echo "ASSESSMENT_FAILED")
@@ -593,12 +573,12 @@ while [ "$PR_READY" != true ] && [ $ELAPSED -lt $MAX_TOTAL_WAIT ]; do
             PR_READY=true
             break
           elif [ "$ASSESSMENT_RESULT" = "ASSESSMENT_FAILED" ]; then
-            print_info "Could not assess review, continuing to wait for fresh review..."
+            print_status "Could not assess review, continuing to wait for fresh review..."
           else
-            print_info "Old review still has actionable items, continuing to wait for fresh review..."
+            print_status "Old review still has actionable items, continuing to wait for fresh review..."
           fi
         else
-          print_info "Assessment script not found, continuing to wait for fresh review..."
+          print_status "Assessment script not found, continuing to wait for fresh review..."
         fi
       fi
     else
@@ -609,7 +589,7 @@ while [ "$PR_READY" != true ] && [ $ELAPSED -lt $MAX_TOTAL_WAIT ]; do
   fi
 
   # Live countdown for next check
-  print_info "No review yet... checking again in ${CHECK_INTERVAL}s (${ELAPSED}s elapsed of ${MAX_TOTAL_WAIT}s max)"
+  print_status "No review yet... checking again in ${CHECK_INTERVAL}s (${ELAPSED}s elapsed of ${MAX_TOTAL_WAIT}s max)"
 
   if [ -t 1 ]; then
     # Interactive terminal - show live countdown

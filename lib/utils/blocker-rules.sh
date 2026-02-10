@@ -249,36 +249,28 @@ check_blockers() {
         return 1
       fi
 
-      # Run all PR-based checks
-      if ! detect_infrastructure_changes "$pr_number"; then
-        blocker_type="infrastructure"
-        blocker_details=$(detect_infrastructure_changes "$pr_number" 2>&1)
-        blocker_detected=true
-      elif ! detect_database_migrations "$pr_number"; then
-        blocker_type="database_migration"
-        blocker_details=$(detect_database_migrations "$pr_number" 2>&1)
-        blocker_detected=true
-      elif ! detect_auth_changes "$pr_number"; then
-        blocker_type="auth_changes"
-        blocker_details=$(detect_auth_changes "$pr_number" 2>&1)
-        blocker_detected=true
-      elif ! detect_doc_changes "$pr_number"; then
-        blocker_type="architectural_docs"
-        blocker_details=$(detect_doc_changes "$pr_number" 2>&1)
-        blocker_detected=true
-      elif ! detect_critical_issues "$pr_number"; then
-        blocker_type="critical_issues"
-        blocker_details=$(detect_critical_issues "$pr_number" 2>&1)
-        blocker_detected=true
-      elif ! detect_expensive_services "$pr_number"; then
-        blocker_type="expensive_services"
-        blocker_details=$(detect_expensive_services "$pr_number" 2>&1)
-        blocker_detected=true
-      elif ! detect_protected_scripts "$pr_number"; then
-        blocker_type="protected_scripts"
-        blocker_details=$(detect_protected_scripts "$pr_number" 2>&1)
-        blocker_detected=true
-      fi
+      # Run all PR-based checks.
+      # Capture output on the first call to avoid running each detector twice
+      # (once for exit code, once for output) which caused duplicate blocker text.
+      local _det_output
+      local _det_checks=("infrastructure:detect_infrastructure_changes"
+                         "database_migration:detect_database_migrations"
+                         "auth_changes:detect_auth_changes"
+                         "architectural_docs:detect_doc_changes"
+                         "critical_issues:detect_critical_issues"
+                         "expensive_services:detect_expensive_services"
+                         "protected_scripts:detect_protected_scripts")
+
+      for _check in "${_det_checks[@]}"; do
+        local _type="${_check%%:*}"
+        local _func="${_check##*:}"
+        _det_output=$($_func "$pr_number" 2>&1) || {
+          blocker_type="$_type"
+          blocker_details="$_det_output"
+          blocker_detected=true
+          break
+        }
+      done
       ;;
 
     session-check)

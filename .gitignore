@@ -9,8 +9,8 @@ Thumbs.db
 .vscode/
 .idea/
 
-# Node (if any tooling added later)
-node_modules/
+# Node (if any tooling added later — no trailing slash to also match symlinks in worktrees)
+node_modules
 
 # Test artifacts
 *.log

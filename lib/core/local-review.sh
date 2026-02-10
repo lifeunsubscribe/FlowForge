@@ -69,8 +69,14 @@ fi
 print_header "🦈 Sharkrite Code Review - PR #$PR_NUMBER"
 echo ""
 
+# Display review method (set by create-pr.sh or review-helper.sh)
+if [ -n "${RITE_REVIEW_REASON:-}" ]; then
+  print_info "Review method: Local Sharkrite"
+  print_status "   Reason: $RITE_REVIEW_REASON"
+fi
+
 # Get PR info
-print_info "Fetching PR information..."
+print_status "Fetching PR information..."
 PR_INFO=$(gh pr view "$PR_NUMBER" --json title,baseRefName,headRefName,url 2>&1) || {
   print_error "Failed to fetch PR #$PR_NUMBER"
   echo "$PR_INFO"
@@ -88,7 +94,7 @@ echo "  URL: $PR_URL"
 echo ""
 
 # Get the diff
-print_info "Fetching PR diff..."
+print_status "Fetching PR diff..."
 PR_DIFF=$(gh pr diff "$PR_NUMBER" 2>&1) || {
   print_error "Failed to fetch diff for PR #$PR_NUMBER"
   echo "$PR_DIFF"
@@ -97,7 +103,7 @@ PR_DIFF=$(gh pr diff "$PR_NUMBER" 2>&1) || {
 
 DIFF_LINES=$(echo "$PR_DIFF" | wc -l | tr -d ' ')
 DIFF_FILES=$(echo "$PR_DIFF" | grep -c "^diff --git" || true)
-print_info "Diff size: $DIFF_FILES files, $DIFF_LINES lines"
+print_status "Diff size: $DIFF_FILES files, $DIFF_LINES lines"
 echo ""
 
 # Handle empty diff
@@ -121,14 +127,14 @@ RITE_TEMPLATE="$RITE_INSTALL_DIR/templates/github/claude-code/pr-review-instruct
 if [ -f "$REPO_TEMPLATE" ]; then
   REVIEW_TEMPLATE="$REPO_TEMPLATE"
   TEMPLATE_LINES=$(wc -l < "$REPO_TEMPLATE" | tr -d ' ')
-  print_info "Using repo-specific review instructions ($TEMPLATE_LINES lines)"
+  print_status "Using repo-specific review instructions ($TEMPLATE_LINES lines)"
 elif [ -f "$RITE_TEMPLATE" ]; then
   REVIEW_TEMPLATE="$RITE_TEMPLATE"
-  print_info "Using Sharkrite default review instructions"
+  print_status "Using Sharkrite default review instructions"
 else
   REVIEW_TEMPLATE=""
   print_warning "No review template found"
-  print_info "Using embedded review instructions"
+  print_status "Using embedded review instructions"
 fi
 
 if [ -z "$REVIEW_TEMPLATE" ]; then
@@ -154,7 +160,7 @@ if [ -f "$RITE_PROJECT_ROOT/CLAUDE.md" ]; then
 ## Project Context (from CLAUDE.md)
 
 $(head -200 "$RITE_PROJECT_ROOT/CLAUDE.md")"
-  print_info "Loaded project context from CLAUDE.md"
+  print_status "Loaded project context from CLAUDE.md"
 fi
 
 # Load previous assessment context if available (for iteration awareness)
@@ -164,40 +170,29 @@ PREVIOUS_ASSESSMENT=$(gh pr view "$PR_NUMBER" --json comments \
   2>/dev/null)
 
 if [ -n "$PREVIOUS_ASSESSMENT" ] && [ "$PREVIOUS_ASSESSMENT" != "null" ]; then
-  print_info "Found previous assessment - review will maintain consistency"
+  print_status "Found previous assessment - excluding resolved items from review"
 
-  # Extract summary from previous assessment
+  # Extract counts from previous assessment
   PREV_NOW=$(echo "$PREVIOUS_ASSESSMENT" | grep -oE "ACTIONABLE_NOW:\*\* [0-9]+" | grep -oE "[0-9]+" || echo "0")
   PREV_LATER=$(echo "$PREVIOUS_ASSESSMENT" | grep -oE "ACTIONABLE_LATER:\*\* [0-9]+" | grep -oE "[0-9]+" || echo "0")
   PREV_DISMISSED=$(echo "$PREVIOUS_ASSESSMENT" | grep -oE "DISMISSED:\*\* [0-9]+" | grep -oE "[0-9]+" || echo "0")
-
-  # Check for linked follow-up issues
-  PR_BODY=$(gh pr view "$PR_NUMBER" --json body --jq '.body' 2>/dev/null || echo "")
-  FOLLOWUP_ISSUES=$(echo "$PR_BODY" | grep -oE "#[0-9]+" | sort -u | tr '\n' ' ' || echo "none")
+  PREV_TOTAL=$((PREV_NOW + PREV_LATER + PREV_DISMISSED))
 
   PREVIOUS_ASSESSMENT_CONTEXT="
 
 ---
 
-## Previous Assessment Context
+## Iteration Context
 
-A previous assessment was performed on this PR. Maintain consistency with prior classifications.
+This is a follow-up review. A previous assessment classified ${PREV_TOTAL} findings:
+- ${PREV_NOW} were fixed in the latest commit(s)
+- ${PREV_LATER} were deferred to follow-up issues
+- ${PREV_DISMISSED} were dismissed as non-issues
 
-**Previous Classification Summary:**
-- ACTIONABLE_NOW: ${PREV_NOW} items (verify these are fixed)
-- ACTIONABLE_LATER: ${PREV_LATER} items (issues created, skip these)
-- DISMISSED: ${PREV_DISMISSED} items (not actionable, skip these)
-
-**Follow-up Issues Created:** ${FOLLOWUP_ISSUES}
-
-**Your Task:**
-1. Verify ACTIONABLE_NOW items from previous assessment are properly fixed
-2. Skip items that already have follow-up issues created
-3. Skip DISMISSED items unless the code has materially changed
-4. Flag genuinely NEW issues only
-
-**Full Previous Assessment:**
-${PREVIOUS_ASSESSMENT}
+**IMPORTANT: Review ONLY the current state of the code in the diff below.**
+Do NOT re-flag previously identified items. They are already handled.
+Your Findings counts must reflect ONLY genuinely new issues in the current code.
+If all code looks correct, your counts should be CRITICAL: 0, HIGH: 0, etc.
 
 ---"
 fi
@@ -251,7 +246,7 @@ else
   ESTIMATE="2-4 minutes"
 fi
 
-print_info "Running Sharkrite review (estimated: $ESTIMATE)..."
+print_status "Running Sharkrite review (estimated: $ESTIMATE)..."
 echo ""
 
 # Run Claude to generate the review
@@ -322,7 +317,7 @@ if [ "$POST_REVIEW" = true ]; then
 
   # Post as PR comment (same location as Claude for GitHub app reviews,
   # enabling seamless switching between local and app review methods)
-  print_info "Posting review to PR #$PR_NUMBER..."
+  print_status "Posting review to PR #$PR_NUMBER..."
 
   REVIEW_RESULT=$(gh pr comment "$PR_NUMBER" --body "$REVIEW_COMMENT" 2>&1) || {
     print_error "Failed to post review"
