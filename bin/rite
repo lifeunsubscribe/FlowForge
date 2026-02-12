@@ -321,35 +321,53 @@ if [ "$MODE" = "init" ]; then
   exit 0
 fi
 
-# Resolve a text description to an issue number by creating a GitHub issue
-resolve_or_create_issue() {
+# Source normalization utilities
+source "$RITE_LIB_DIR/utils/normalize-issue.sh"
+
+# Normalize and resolve issue input.
+# Runs in the MAIN shell (not a subshell) so NORMALIZED_SUBJECT, WORK_DESCRIPTION,
+# ISSUE_NUMBER, and ISSUE_DESC are available to the calling scope.
+#
+# For numeric input: fetches issue details from GitHub, applies bash cleanup to title.
+# For text input: uses Claude to generate a structured issue, prompts for approval.
+normalize_and_resolve() {
   local input="$1"
 
-  # Already a number — return as-is
   if [[ "$input" =~ ^[0-9]+$ ]]; then
-    echo "$input"
-    return 0
+    # Pre-existing issue — fetch details, then normalize title
+    ISSUE_NUMBER="$input"
+
+    ISSUE_JSON=$(gh issue view "$ISSUE_NUMBER" --json title,body,state 2>/dev/null || echo "")
+    if [ -z "$ISSUE_JSON" ] || [ "$ISSUE_JSON" = "null" ]; then
+      print_error "Issue #$ISSUE_NUMBER not found on GitHub"
+      exit 1
+    fi
+
+    ISSUE_DESC=$(echo "$ISSUE_JSON" | jq -r '.title')
+    ISSUE_BODY=$(echo "$ISSUE_JSON" | jq -r '.body // ""')
+    local issue_state
+    issue_state=$(echo "$ISSUE_JSON" | jq -r '.state')
+
+    if [ -z "$ISSUE_DESC" ] || [ "$ISSUE_DESC" = "null" ]; then
+      print_error "Issue #$ISSUE_NUMBER has no title"
+      exit 1
+    fi
+
+    if [ "$issue_state" = "CLOSED" ]; then
+      print_warning "Issue #$ISSUE_NUMBER is already CLOSED — proceeding anyway"
+    fi
+
+    normalize_existing_issue  # Sets NORMALIZED_SUBJECT, WORK_DESCRIPTION
+  else
+    # Text description — generate structured issue via Claude, prompt for approval
+    if ! normalize_piped_input "$input"; then
+      exit 1
+    fi
+    # normalize_piped_input sets: ISSUE_NUMBER, ISSUE_DESC, NORMALIZED_SUBJECT,
+    # WORK_DESCRIPTION, GENERATED_ISSUE_BODY
   fi
 
-  # Text description — create a GitHub issue
-  print_info "Creating GitHub issue from description..." >&2
-  local issue_url
-  issue_url=$(gh issue create --title "$input" --body "Created by rite from CLI description." 2>&1)
-  if [ $? -ne 0 ]; then
-    print_error "Failed to create GitHub issue: $issue_url" >&2
-    exit 1
-  fi
-
-  # Extract issue number from URL (e.g., https://github.com/owner/repo/issues/42)
-  local issue_number
-  issue_number=$(echo "$issue_url" | grep -oE '[0-9]+$')
-  if [ -z "$issue_number" ]; then
-    print_error "Could not extract issue number from: $issue_url" >&2
-    exit 1
-  fi
-
-  print_success "Created issue #${issue_number}: ${input}" >&2
-  echo "$issue_number"
+  export ISSUE_NUMBER ISSUE_DESC NORMALIZED_SUBJECT WORK_DESCRIPTION
 }
 
 # Pre-flight: check Claude CLI is available (not needed for --undo)
@@ -407,8 +425,8 @@ if [ ${#ARGS[@]} -eq 0 ] && [ -z "$FILTER" ]; then
   echo "Run 'rite --help' for usage"
   exit 1
 elif [ ${#ARGS[@]} -eq 1 ] && [ "$MODE" = "full" ]; then
-  # Resolve text descriptions to issue numbers
-  ISSUE_NUMBER=$(resolve_or_create_issue "${ARGS[0]}")
+  # Normalize and resolve (runs in main shell — sets ISSUE_NUMBER, NORMALIZED_SUBJECT, etc.)
+  normalize_and_resolve "${ARGS[0]}"
   # Full lifecycle: work -> PR -> review -> fixes -> merge
   # Default to unsupervised (--auto) unless --supervised was explicitly passed
   if [ "$SUPERVISED" = false ]; then
@@ -417,8 +435,8 @@ elif [ ${#ARGS[@]} -eq 1 ] && [ "$MODE" = "full" ]; then
     exec "$RITE_LIB_DIR/core/workflow-runner.sh" "$ISSUE_NUMBER" "${WORKFLOW_FLAGS[@]+"${WORKFLOW_FLAGS[@]}"}"
   fi
 elif [ ${#ARGS[@]} -eq 1 ] && [ "$MODE" = "quick" ]; then
-  # Resolve text descriptions to issue numbers
-  ISSUE_NUMBER=$(resolve_or_create_issue "${ARGS[0]}")
+  # Normalize and resolve (runs in main shell)
+  normalize_and_resolve "${ARGS[0]}"
   # Quick mode: work -> PR only (skip review wait and merge)
   print_info "Quick mode: issue #${ISSUE_NUMBER} (work + PR, skip review/merge)"
   "$RITE_LIB_DIR/core/claude-workflow.sh" "$ISSUE_NUMBER" --auto
@@ -430,9 +448,12 @@ elif [ "$MODE" = "undo" ] && [ ${#ARGS[@]} -ne 1 ]; then
   echo "Usage: rite <issue> --undo"
   exit 1
 elif [ ${#ARGS[@]} -eq 1 ] && [ "$MODE" = "undo" ]; then
-  # Undo mode: close PR, clean up all workflow artifacts
-  ISSUE_NUMBER=$(resolve_or_create_issue "${ARGS[0]}")
-  exec "$RITE_LIB_DIR/core/undo-workflow.sh" "$ISSUE_NUMBER"
+  # Undo mode: no normalization needed, just validate and pass through
+  if [[ ! "${ARGS[0]}" =~ ^[0-9]+$ ]]; then
+    print_error "--undo requires an issue number, not a description"
+    exit 1
+  fi
+  exec "$RITE_LIB_DIR/core/undo-workflow.sh" "${ARGS[0]}"
 elif [ ${#ARGS[@]} -gt 1 ] || [ -n "$FILTER" ]; then
   # Batch mode
   print_info "Batch processing ${#ARGS[@]} issues"

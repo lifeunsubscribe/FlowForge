@@ -217,8 +217,10 @@ if [ "$PR_EXISTS" = false ]; then
     fi
   fi
 
-  # Generate PR title
-  if [ ! -z "$ISSUE_NUMBER" ] && [ ! -z "$ISSUE_TITLE" ]; then
+  # Generate PR title — prefer NORMALIZED_SUBJECT (clean, <=50 chars, prefixed)
+  if [ -n "${NORMALIZED_SUBJECT:-}" ]; then
+    PR_TITLE="$NORMALIZED_SUBJECT"
+  elif [ ! -z "$ISSUE_NUMBER" ] && [ ! -z "$ISSUE_TITLE" ]; then
     PR_TITLE="$ISSUE_TITLE"
   else
     # Extract title from branch name

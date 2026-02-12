@@ -20,6 +20,7 @@ source "$RITE_LIB_DIR/utils/notifications.sh"
 source "$RITE_LIB_DIR/utils/blocker-rules.sh"
 source "$RITE_LIB_DIR/utils/session-tracker.sh"
 source "$RITE_LIB_DIR/utils/pr-summary.sh"
+source "$RITE_LIB_DIR/utils/normalize-issue.sh"
 
 # Workflow mode: supervised (requires confirmations) or unsupervised (fully automated)
 WORKFLOW_MODE="${WORKFLOW_MODE:-supervised}"
@@ -1216,90 +1217,134 @@ run_workflow() {
     return 0
   fi
 
-  # Determine starting phase by inspecting actual PR state (not just saved file).
-  # The workflow is idempotent: each run checks what's done and picks up where needed.
+  # Ensure normalization variables are set.
+  # bin/rite exports these before exec'ing workflow-runner.sh, but on direct invocation
+  # or edge cases they may be missing. Fetch and normalize silently (skip approval on resume).
+  if [ -z "${NORMALIZED_SUBJECT:-}" ]; then
+    local _issue_json
+    _issue_json=$(gh issue view "$issue_number" --json title,body 2>/dev/null || echo "")
+    if [ -n "$_issue_json" ] && [ "$_issue_json" != "null" ]; then
+      ISSUE_DESC=$(echo "$_issue_json" | jq -r '.title // ""')
+      ISSUE_BODY=$(echo "$_issue_json" | jq -r '.body // ""')
+      RITE_SKIP_APPROVAL=true normalize_existing_issue
+      export NORMALIZED_SUBJECT WORK_DESCRIPTION
+    fi
+  fi
+
+  # Determine starting phase by inspecting actual PR state.
+  # This runs every time (not just RESUME_MODE) so re-running always picks up
+  # where the last run left off, with a consolidated resume summary.
   # Phase order: pre-start -> claude-workflow -> create-pr -> assess-resolve -> merge
   local skip_to_phase=""
 
-  # If resuming and we have a worktree, detect PR and inspect its state
-  if [ "$RESUME_MODE" = true ] && [ -n "$WORKTREE_PATH" ] && [ -d "$WORKTREE_PATH" ]; then
-    # Detect PR number from branch if not already set
-    if [ -z "${PR_NUMBER:-}" ]; then
-      cd "$WORKTREE_PATH" 2>/dev/null || true
-      local branch_name=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
-      if [ -n "$branch_name" ]; then
-        PR_NUMBER=$(gh pr list --head "$branch_name" --json number --jq '.[0].number' 2>/dev/null || echo "")
-        if [ -n "$PR_NUMBER" ] && [ "$PR_NUMBER" != "null" ]; then
-          CURRENT_PR="$PR_NUMBER"
-          export PR_NUMBER
-        fi
+  # ── Detect existing PR for this issue (if not already known from session state) ──
+  if [ -z "${PR_NUMBER:-}" ] || [ "${PR_NUMBER:-}" = "null" ]; then
+    # Method 1: Search by issue link in PR body
+    local _detected_pr=$(gh pr list --state open --json number,body --limit 100 2>/dev/null | \
+      jq --arg issue "$issue_number" -r '.[] | select(.body | test("(Closes|closes|Fixes|fixes|Resolves|resolves) #" + $issue + "\\b")) | .number' | \
+      head -1)
+
+    # Method 2: Detect from worktree branch (session state may have worktree but no PR)
+    if { [ -z "$_detected_pr" ] || [ "$_detected_pr" = "null" ]; } && [ -n "${WORKTREE_PATH:-}" ] && [ -d "${WORKTREE_PATH:-}" ]; then
+      local _branch=$(git -C "$WORKTREE_PATH" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+      if [ -n "$_branch" ]; then
+        _detected_pr=$(gh pr list --head "$_branch" --json number --jq '.[0].number' 2>/dev/null || echo "")
       fi
     fi
 
-    # Inspect PR comments to determine what work is already done
-    if [ -n "${PR_NUMBER:-}" ] && [ "$PR_NUMBER" != "null" ]; then
-      print_status "Inspecting PR #$PR_NUMBER state..."
+    if [ -n "$_detected_pr" ] && [ "$_detected_pr" != "null" ]; then
+      PR_NUMBER="$_detected_pr"
+      CURRENT_PR="$PR_NUMBER"
+      export PR_NUMBER
+    fi
+  fi
 
-      # Get latest commit time, review/assessment comments, and follow-up markers in one API call
-      local pr_state_json=$(gh pr view "$PR_NUMBER" --json comments,commits --jq '{
-        latest_commit: (.commits[-1].committedDate // ""),
-        latest_review: ([.comments[] | select(
-          .author.login == "claude" or .author.login == "claude[bot]" or
-          .author.login == "github-actions[bot]" or
-          (.body | contains("<!-- sharkrite-local-review"))
-        )] | sort_by(.createdAt) | reverse | .[0].createdAt // ""),
-        latest_assessment: ([.comments[] | select(
-          .body | contains("<!-- sharkrite-assessment")
-        )] | sort_by(.createdAt) | reverse | .[0].body // ""),
-        has_followup: ([.comments[] | select(
-          .body | contains("sharkrite-followup-issue:")
-        )] | length > 0)
-      }' 2>/dev/null || echo "{}")
-
-      local pr_latest_commit=$(echo "$pr_state_json" | jq -r '.latest_commit // ""' 2>/dev/null)
-      local pr_latest_review=$(echo "$pr_state_json" | jq -r '.latest_review // ""' 2>/dev/null)
-      local pr_latest_assessment=$(echo "$pr_state_json" | jq -r '.latest_assessment // ""' 2>/dev/null)
-      local pr_has_followup=$(echo "$pr_state_json" | jq -r '.has_followup // false' 2>/dev/null)
-
-      # Determine state: review current? assessment exists? assessment approves?
-      local review_is_current=false
-      if [ -n "$pr_latest_review" ] && [ -n "$pr_latest_commit" ]; then
-        # ISO timestamp comparison works lexicographically
-        if [[ "$pr_latest_review" > "$pr_latest_commit" ]]; then
-          review_is_current=true
-        fi
-      fi
-
-      if [ "$review_is_current" = true ] && [ -n "$pr_latest_assessment" ]; then
-        # Assessment exists — does it approve?
-        local actionable_now=$(echo "$pr_latest_assessment" | grep -c "^### .* - ACTIONABLE_NOW" || true)
-        local actionable_later=$(echo "$pr_latest_assessment" | grep -c "^### .* - ACTIONABLE_LATER" || true)
-
-        if [ "$actionable_now" -eq 0 ]; then
-          # Check: if ACTIONABLE_LATER items exist, tech-debt issues must be created first
-          if [ "$actionable_later" -gt 0 ] && [ "$pr_has_followup" != "true" ]; then
-            skip_to_phase="assess-resolve"
-            print_info "PR state: assessment passes but $actionable_later ACTIONABLE_LATER items need tech-debt issues"
-          else
-            skip_to_phase="merge"
-            print_info "PR state: review current, assessment passes → skipping to merge"
+  # ── Detect worktree for this PR's branch (if not already known) ──
+  if [ -n "${PR_NUMBER:-}" ] && [ "${PR_NUMBER:-}" != "null" ]; then
+    if [ -z "${WORKTREE_PATH:-}" ] || [ ! -d "${WORKTREE_PATH:-}" ]; then
+      local _pr_branch=$(gh pr view "$PR_NUMBER" --json headRefName --jq '.headRefName' 2>/dev/null || echo "")
+      if [ -n "$_pr_branch" ]; then
+        local _wt_path=$(git worktree list | grep "\[$_pr_branch\]" | awk '{print $1}')
+        if [ -n "$_wt_path" ] && [ -d "$_wt_path" ]; then
+          local _file_changes=$(git -C "$_wt_path" diff --name-only origin/main..HEAD 2>/dev/null | wc -l | tr -d ' ')
+          if [ "$_file_changes" -gt 0 ]; then
+            WORKTREE_PATH="$_wt_path"
+            set_current_worktree "$WORKTREE_PATH"
+            RESUME_MODE=true
           fi
-        else
-          skip_to_phase="assess-resolve"
-          print_info "PR state: assessment has $actionable_now ACTIONABLE_NOW items → entering fix loop"
         fi
-      elif [ "$review_is_current" = true ]; then
-        skip_to_phase="assess-resolve"
-        print_info "PR state: review current, no assessment → running assessment"
-      else
-        # No current review — Phase 2 will handle it
-        # (Phase 1 will also check if dev work exists)
-        print_info "PR state: no current review → running from development"
       fi
     fi
   fi
 
-  # Show skip summary when resuming past earlier phases
+  # ── Inspect PR state to skip completed phases ──
+  if [ -n "${PR_NUMBER:-}" ] && [ "$PR_NUMBER" != "null" ] && [ -n "${WORKTREE_PATH:-}" ] && [ -d "$WORKTREE_PATH" ]; then
+    print_status "Inspecting PR #$PR_NUMBER state..."
+
+    # Get latest commit time, review/assessment comments, and follow-up markers in one API call
+    local pr_state_json=$(gh pr view "$PR_NUMBER" --json comments,commits --jq '{
+      latest_commit: (.commits[-1].committedDate // ""),
+      latest_review: ([.comments[] | select(
+        .author.login == "claude" or .author.login == "claude[bot]" or
+        .author.login == "github-actions[bot]" or
+        (.body | contains("<!-- sharkrite-local-review"))
+      )] | sort_by(.createdAt) | reverse | .[0].createdAt // ""),
+      latest_assessment: ([.comments[] | select(
+        .body | contains("<!-- sharkrite-assessment")
+      )] | sort_by(.createdAt) | reverse | .[0].body // ""),
+      has_followup: ([.comments[] | select(
+        .body | contains("sharkrite-followup-issue:")
+      )] | length > 0)
+    }' 2>/dev/null || echo "{}")
+
+    local pr_latest_commit=$(echo "$pr_state_json" | jq -r '.latest_commit // ""' 2>/dev/null)
+    local pr_latest_review=$(echo "$pr_state_json" | jq -r '.latest_review // ""' 2>/dev/null)
+    local pr_latest_assessment=$(echo "$pr_state_json" | jq -r '.latest_assessment // ""' 2>/dev/null)
+    local pr_has_followup=$(echo "$pr_state_json" | jq -r '.has_followup // false' 2>/dev/null)
+
+    # Determine state: review current? assessment exists? assessment approves?
+    local review_is_current=false
+    if [ -n "$pr_latest_review" ] && [ -n "$pr_latest_commit" ]; then
+      # ISO timestamp comparison works lexicographically
+      if [[ "$pr_latest_review" > "$pr_latest_commit" ]]; then
+        review_is_current=true
+      fi
+    fi
+
+    if [ "$review_is_current" = true ] && [ -n "$pr_latest_assessment" ]; then
+      # Assessment exists — does it approve?
+      local actionable_now=$(echo "$pr_latest_assessment" | grep -c "^### .* - ACTIONABLE_NOW" || true)
+      local actionable_later=$(echo "$pr_latest_assessment" | grep -c "^### .* - ACTIONABLE_LATER" || true)
+
+      if [ "$actionable_now" -eq 0 ]; then
+        # Check: if ACTIONABLE_LATER items exist, tech-debt issues must be created first
+        if [ "$actionable_later" -gt 0 ] && [ "$pr_has_followup" != "true" ]; then
+          skip_to_phase="assess-resolve"
+          print_info "PR state: assessment passes but $actionable_later ACTIONABLE_LATER items need tech-debt issues"
+        else
+          skip_to_phase="merge"
+          print_info "PR state: review current, assessment passes → skipping to merge"
+        fi
+      else
+        skip_to_phase="assess-resolve"
+        print_info "PR state: assessment has $actionable_now ACTIONABLE_NOW items → entering fix loop"
+      fi
+    elif [ "$review_is_current" = true ]; then
+      skip_to_phase="assess-resolve"
+      print_info "PR state: review current, no assessment → running assessment"
+    else
+      # Review stale or missing — skip dev if work exists, run from push/review
+      local _dev_changes=$(git -C "$WORKTREE_PATH" diff --name-only origin/main..HEAD 2>/dev/null | wc -l | tr -d ' ')
+      if [ "${_dev_changes:-0}" -gt 0 ]; then
+        skip_to_phase="create-pr"
+        print_info "PR state: dev complete, review needs refresh → running from push/review"
+      else
+        print_info "PR state: no implementation yet → running from development"
+      fi
+    fi
+  fi
+
+  # Show skip summary when phases are being skipped
   if [ -n "$skip_to_phase" ]; then
     print_header "Resume Summary"
     if [ "$skip_to_phase" = "merge" ]; then
